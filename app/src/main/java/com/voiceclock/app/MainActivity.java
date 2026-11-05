@@ -88,7 +88,7 @@ public class MainActivity extends AppCompatActivity {
     private void updateUI() {
         if (serviceRunning) {
             btnStartStop.setText("停止服务");
-            tvStatus.setText("服务状态：运行中\n语音助手正在监听...\n说\u201C几点了\u201D获取当前时间");
+            tvStatus.setText("服务状态：运行中\n离线语音助手正在监听...\n说\u201C几点了\u201D获取当前时间");
         } else {
             btnStartStop.setText("启动服务");
             tvStatus.setText("服务状态：已停止\n点击按钮启动语音助手");

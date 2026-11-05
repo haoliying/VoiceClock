@@ -6,35 +6,49 @@ import android.app.NotificationManager;
 import android.app.Service;
 import android.content.Intent;
 import android.os.Build;
-import android.os.Bundle;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
-import android.speech.RecognitionListener;
-import android.speech.RecognizerIntent;
-import android.speech.SpeechRecognizer;
 import android.speech.tts.TextToSpeech;
 import android.util.Log;
 
 import androidx.core.app.NotificationCompat;
 
-import java.util.ArrayList;
+import org.json.JSONObject;
+
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.util.Calendar;
 import java.util.Locale;
 
-public class VoiceService extends Service implements RecognitionListener {
+import android.media.AudioFormat;
+import android.media.AudioRecord;
+import android.media.MediaRecorder;
+
+import org.vosk.Model;
+import org.vosk.Recognizer;
+
+public class VoiceService extends Service {
 
     private static final String TAG = "VoiceService";
     private static final String CHANNEL_ID = "voice_clock_channel";
     private static final int NOTIFICATION_ID = 1;
-    private static final long RESTART_DELAY_MS = 1000;
+    private static final int SAMPLE_RATE = 16000;
+    private static final int BUFFER_SIZE = 8000;
 
     public static boolean isRunning = false;
 
-    private SpeechRecognizer speechRecognizer;
+    private Model voskModel;
+    private Recognizer recognizer;
+    private AudioRecord audioRecord;
     private TextToSpeech textToSpeech;
     private Handler handler;
-    private boolean isListening = false;
+    private Thread recognitionThread;
+    private volatile boolean isListening = false;
 
     @Override
     public void onCreate() {
@@ -42,15 +56,143 @@ public class VoiceService extends Service implements RecognitionListener {
         handler = new Handler(Looper.getMainLooper());
         createNotificationChannel();
         initTTS();
-        initSpeechRecognizer();
         isRunning = true;
+        loadModelAndStart();
+    }
+
+    private void loadModelAndStart() {
+        new Thread(() -> {
+            try {
+                // Copy model from assets to internal storage if needed
+                String modelPath = getFilesDir().getAbsolutePath() + "/vosk-model";
+                File modelDir = new File(modelPath);
+                if (!modelDir.exists()) {
+                    copyAssetFolder("model", modelPath);
+                }
+
+                voskModel = new Model(modelPath);
+                recognizer = new Recognizer(voskModel, SAMPLE_RATE);
+
+                initAudioRecord();
+                startRecognitionLoop();
+
+                Log.d(TAG, "Vosk model loaded and recognition started");
+            } catch (Exception e) {
+                Log.e(TAG, "Failed to load Vosk model", e);
+            }
+        }).start();
+    }
+
+    private void copyAssetFolder(String assetFolder, String destPath) throws IOException {
+        File destDir = new File(destPath);
+        destDir.mkdirs();
+
+        String[] files = getAssets().list(assetFolder);
+        if (files == null) return;
+
+        for (String fileName : files) {
+            String assetPath = assetFolder + "/" + fileName;
+            String destFilePath = destPath + "/" + fileName;
+
+            // Try to list as directory
+            String[] subFiles = getAssets().list(assetPath);
+            if (subFiles != null && subFiles.length > 0) {
+                copyAssetFolder(assetPath, destFilePath);
+            } else {
+                copyAssetFile(assetPath, destFilePath);
+            }
+        }
+    }
+
+    private void copyAssetFile(String assetPath, String destPath) throws IOException {
+        InputStream in = getAssets().open(assetPath);
+        FileOutputStream out = new FileOutputStream(destPath);
+        byte[] buffer = new byte[4096];
+        int read;
+        while ((read = in.read(buffer)) != -1) {
+            out.write(buffer, 0, read);
+        }
+        in.close();
+        out.close();
+    }
+
+    private void initAudioRecord() {
+        int bufferSize = AudioRecord.getMinBufferSize(
+                SAMPLE_RATE,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT
+        );
+
+        audioRecord = new AudioRecord(
+                MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                SAMPLE_RATE,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT,
+                Math.max(bufferSize, BUFFER_SIZE)
+        );
+    }
+
+    private void startRecognitionLoop() {
+        isListening = true;
+        recognitionThread = new Thread(() -> {
+            audioRecord.startRecording();
+            byte[] buffer = new byte[BUFFER_SIZE];
+
+            while (isListening) {
+                int bytesRead = audioRecord.read(buffer, 0, buffer.length);
+                if (bytesRead > 0 && recognizer != null) {
+                    if (recognizer.acceptWaveForm(buffer, bytesRead)) {
+                        // Final result for an utterance
+                        String result = recognizer.getResult();
+                        processResult(result);
+                    } else {
+                        // Partial result
+                        String partial = recognizer.getPartialResult();
+                        processPartialResult(partial);
+                    }
+                }
+            }
+        });
+        recognitionThread.start();
+    }
+
+    private void processResult(String resultJson) {
+        try {
+            JSONObject json = new JSONObject(resultJson);
+            String text = json.optString("text", "");
+            Log.d(TAG, "Recognized: " + text);
+
+            if (containsTimeQuery(text)) {
+                handler.post(() -> speakTime());
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Error parsing result", e);
+        }
+    }
+
+    private void processPartialResult(String partialJson) {
+        try {
+            JSONObject json = new JSONObject(partialJson);
+            String text = json.optString("partial", "");
+
+            if (containsTimeQuery(text)) {
+                handler.post(() -> speakTime());
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Error parsing partial result", e);
+        }
+    }
+
+    private boolean containsTimeQuery(String text) {
+        if (text == null || text.isEmpty()) return false;
+        return text.contains("\u51e0\u70b9\u4e86") || text.contains("\u51e0\u70b9\u5566") || text.contains("\u4ec0\u4e48\u65f6\u95f4")
+                || text.contains("\u73b0\u5728\u65f6\u95f4") || text.contains("\u51e0\u65f6") || text.contains("\u51e0\u70b9");
     }
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         Notification notification = buildNotification();
         startForeground(NOTIFICATION_ID, notification);
-        startListening();
         return START_STICKY;
     }
 
@@ -58,14 +200,38 @@ public class VoiceService extends Service implements RecognitionListener {
     public void onDestroy() {
         super.onDestroy();
         isRunning = false;
-        if (speechRecognizer != null) {
-            speechRecognizer.destroy();
-            speechRecognizer = null;
+        isListening = false;
+
+        if (audioRecord != null) {
+            try {
+                audioRecord.stop();
+            } catch (Exception e) {
+                // ignore
+            }
+            audioRecord.release();
+            audioRecord = null;
         }
+
+        if (recognitionThread != null) {
+            recognitionThread.interrupt();
+            recognitionThread = null;
+        }
+
+        if (recognizer != null) {
+            recognizer.close();
+            recognizer = null;
+        }
+
+        if (voskModel != null) {
+            voskModel.close();
+            voskModel = null;
+        }
+
         if (textToSpeech != null) {
             textToSpeech.shutdown();
             textToSpeech = null;
         }
+
         handler.removeCallbacksAndMessages(null);
     }
 
@@ -78,10 +244,10 @@ public class VoiceService extends Service implements RecognitionListener {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             NotificationChannel channel = new NotificationChannel(
                     CHANNEL_ID,
-                    "语音助手",
+                    "\u8bed\u97f3\u52a9\u624b",
                     NotificationManager.IMPORTANCE_LOW
             );
-            channel.setDescription("语音时钟助手通知");
+            channel.setDescription("\u8bed\u97f3\u65f6\u949f\u52a9\u624b\u901a\u77e5");
             NotificationManager manager = getSystemService(NotificationManager.class);
             if (manager != null) {
                 manager.createNotificationChannel(channel);
@@ -91,8 +257,8 @@ public class VoiceService extends Service implements RecognitionListener {
 
     private Notification buildNotification() {
         return new NotificationCompat.Builder(this, CHANNEL_ID)
-                .setContentTitle("语音助手运行中")
-                .setContentText("正在监听语音...说\"几点了\"获取时间")
+                .setContentTitle("\u8bed\u97f3\u52a9\u624b\u8fd0\u884c\u4e2d")
+                .setContentText("\u79bb\u7ebf\u76d1\u542c\u4e2d...\u8bf4\"\u51e0\u70b9\u4e86\"\u83b7\u53d6\u65f6\u95f4")
                 .setSmallIcon(R.drawable.ic_notification)
                 .setOngoing(true)
                 .build();
@@ -105,53 +271,14 @@ public class VoiceService extends Service implements RecognitionListener {
                 if (status == TextToSpeech.SUCCESS) {
                     int result = textToSpeech.setLanguage(Locale.CHINESE);
                     if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
-                        Log.w(TAG, "Chinese language not supported, trying default");
+                        Log.w(TAG, "Chinese TTS not available, using default");
                         textToSpeech.setLanguage(Locale.getDefault());
                     }
                 } else {
-                    Log.e(TAG, "TTS initialization failed with status: " + status);
+                    Log.e(TAG, "TTS init failed: " + status);
                 }
             }
         });
-    }
-
-    private void initSpeechRecognizer() {
-        if (SpeechRecognizer.isRecognitionAvailable(this)) {
-            speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this);
-            speechRecognizer.setRecognitionListener(this);
-        } else {
-            Log.e(TAG, "Speech recognition not available on this device");
-        }
-    }
-
-    private void startListening() {
-        if (speechRecognizer == null || isListening) return;
-
-        Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
-        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
-        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.CHINESE);
-        intent.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true);
-        intent.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1);
-
-        try {
-            speechRecognizer.startListening(intent);
-            isListening = true;
-        } catch (Exception e) {
-            Log.e(TAG, "Error starting listening", e);
-            isListening = false;
-            scheduleRestart();
-        }
-    }
-
-    private void scheduleRestart() {
-        handler.postDelayed(new Runnable() {
-            @Override
-            public void run() {
-                if (isRunning) {
-                    startListening();
-                }
-            }
-        }, RESTART_DELAY_MS);
     }
 
     private void speakTime() {
@@ -161,96 +288,25 @@ public class VoiceService extends Service implements RecognitionListener {
 
         String period;
         if (hour < 6) {
-            period = "凌晨";
+            period = "\u51cc\u6668";
         } else if (hour < 12) {
-            period = "上午";
+            period = "\u4e0a\u5348";
         } else if (hour < 14) {
-            period = "中午";
+            period = "\u4e2d\u5348";
         } else if (hour < 18) {
-            period = "下午";
+            period = "\u4e0b\u5348";
         } else {
-            period = "晚上";
+            period = "\u665a\u4e0a";
         }
 
         int displayHour = hour % 12;
         if (displayHour == 0) displayHour = 12;
 
-        String timeText = "现在是" + period + displayHour + "点" + minute + "分";
+        String timeText = "\u73b0\u5728\u662f" + period + displayHour + "\u70b9" + minute + "\u5206";
         Log.d(TAG, "Speaking: " + timeText);
 
         if (textToSpeech != null) {
             textToSpeech.speak(timeText, TextToSpeech.QUEUE_FLUSH, null, "time_announcement");
         }
-    }
-
-    // RecognitionListener methods
-    @Override
-    public void onReadyForSpeech(Bundle params) {
-        Log.d(TAG, "Ready for speech");
-    }
-
-    @Override
-    public void onBeginningOfSpeech() {
-        Log.d(TAG, "Beginning of speech");
-    }
-
-    @Override
-    public void onRmsChanged(float rmsdB) {
-        // Not used
-    }
-
-    @Override
-    public void onBufferReceived(byte[] buffer) {
-        // Not used
-    }
-
-    @Override
-    public void onEndOfSpeech() {
-        Log.d(TAG, "End of speech");
-        isListening = false;
-        scheduleRestart();
-    }
-
-    @Override
-    public void onError(int error) {
-        Log.w(TAG, "Speech recognition error: " + error);
-        isListening = false;
-        scheduleRestart();
-    }
-
-    @Override
-    public void onResults(Bundle results) {
-        Log.d(TAG, "Got results");
-        isListening = false;
-
-        ArrayList<String> matches = results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
-        if (matches != null && !matches.isEmpty()) {
-            String text = matches.get(0);
-            Log.d(TAG, "Recognized: " + text);
-
-            if (text.contains("几点了") || text.contains("几点啦") || text.contains("什么时间")
-                    || text.contains("现在时间") || text.contains("几时")) {
-                speakTime();
-            }
-        }
-
-        scheduleRestart();
-    }
-
-    @Override
-    public void onPartialResults(Bundle partialResults) {
-        ArrayList<String> matches = partialResults.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
-        if (matches != null && !matches.isEmpty()) {
-            String text = matches.get(0);
-            if (text.contains("几点了") || text.contains("几点啦") || text.contains("什么时间")
-                    || text.contains("现在时间") || text.contains("几时")) {
-                speakTime();
-            }
-        }
-    }
-
-    @Override
-    public void onEvent(int eventType, Bundle params) {
-        // Not used
     }
 }
