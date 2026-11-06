@@ -39,7 +39,9 @@ public class VoiceService extends Service {
     private static final int SAMPLE_RATE = 16000;
 
     public static final String ACTION_STATUS = "com.voiceclock.STATUS";
+    public static final String ACTION_DEBUG = "com.voiceclock.DEBUG";
     public static final String EXTRA_STATUS = "status";
+    public static final String EXTRA_DEBUG = "debug";
     public static final String STATUS_LOADING = "loading";
     public static final String STATUS_READY = "ready";
     public static final String STATUS_ERROR = "error";
@@ -75,8 +77,15 @@ public class VoiceService extends Service {
         updateNotification(status);
     }
 
+    private void broadcastDebug(String message) {
+        Intent intent = new Intent(ACTION_DEBUG);
+        intent.putExtra(EXTRA_DEBUG, message);
+        LocalBroadcastManager.getInstance(this).sendBroadcast(intent);
+    }
+
     private void loadModelAndStart() {
         broadcastStatus(STATUS_LOADING);
+        broadcastDebug("[init] \u5f00\u59cb\u52a0\u8f7d\u79bb\u7ebf\u6a21\u578b...");
         new Thread(() -> {
             try {
                 Log.d(TAG, "Starting model load...");
@@ -86,6 +95,7 @@ public class VoiceService extends Service {
                 File markerFile = new File(modelDir, ".ready");
 
                 if (!markerFile.exists()) {
+                    broadcastDebug("[init] \u6b63\u5728\u590d\u5236\u6a21\u578b\u6587\u4ef6...");
                     Log.d(TAG, "Copying model from assets to internal storage...");
                     if (modelDir.exists()) {
                         deleteRecursive(modelDir);
@@ -93,13 +103,16 @@ public class VoiceService extends Service {
                     modelDir.mkdirs();
                     copyAssetFolder("model", modelPath);
                     markerFile.createNewFile();
+                    broadcastDebug("[init] \u6a21\u578b\u590d\u5236\u5b8c\u6210");
                     Log.d(TAG, "Model copy complete");
                 } else {
                     Log.d(TAG, "Model already copied, skipping");
                 }
 
+                broadcastDebug("[init] \u6b63\u5728\u52a0\u8f7d Vosk \u6a21\u578b...");
                 Log.d(TAG, "Loading Vosk model from: " + modelPath);
                 voskModel = new Model(modelPath);
+                broadcastDebug("[ok] Vosk \u6a21\u578b\u52a0\u8f7d\u6210\u529f");
                 Log.d(TAG, "Vosk model loaded successfully");
 
                 recognizer = new Recognizer(voskModel, SAMPLE_RATE);
@@ -107,18 +120,22 @@ public class VoiceService extends Service {
 
                 if (!initAudioRecord()) {
                     lastError = "AudioRecord init failed";
+                    broadcastDebug("[error] \u97f3\u9891\u5f55\u5236\u521d\u59cb\u5316\u5931\u8d25");
                     Log.e(TAG, "AudioRecord initialization failed!");
                     broadcastStatus(STATUS_ERROR);
                     return;
                 }
 
+                broadcastDebug("[ok] \u97f3\u9891\u5f55\u5236\u521d\u59cb\u5316\u6210\u529f");
                 modelReady = true;
                 startRecognitionLoop();
                 broadcastStatus(STATUS_READY);
+                broadcastDebug("[ready] \u5df2\u5c31\u7eea\uff0c\u5f00\u59cb\u76d1\u542c...\u8bf7\u8bf4\u8bdd");
                 Log.d(TAG, "Voice service fully started and listening");
 
             } catch (Exception e) {
                 lastError = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
+                broadcastDebug("[error] " + lastError);
                 Log.e(TAG, "Failed to start voice service: " + lastError, e);
                 broadcastStatus(STATUS_ERROR);
             }
@@ -263,12 +280,15 @@ public class VoiceService extends Service {
             JSONObject json = new JSONObject(resultJson);
             String text = json.optString("text", "");
             Log.d(TAG, "Final result: [" + text + "]");
+            broadcastDebug("[\u8bc6\u522b] " + text);
 
             if (containsTimeQuery(text)) {
+                broadcastDebug("[\u547d\u4e2d] \u68c0\u6d4b\u5230\u65f6\u95f4\u8be2\u95ee\uff01");
                 handler.post(() -> speakTime());
             }
         } catch (Exception e) {
             Log.e(TAG, "Error parsing result", e);
+            broadcastDebug("[error] \u89e3\u6790\u7ed3\u679c\u5931\u8d25");
         }
     }
 
@@ -279,9 +299,11 @@ public class VoiceService extends Service {
 
             if (!text.isEmpty()) {
                 Log.d(TAG, "Partial: [" + text + "]");
+                broadcastDebug("[\u8bed\u97f3] " + text);
             }
 
             if (containsTimeQuery(text)) {
+                broadcastDebug("[\u547d\u4e2d] \u68c0\u6d4b\u5230\u65f6\u95f4\u8be2\u95ee\uff01");
                 handler.post(() -> speakTime());
             }
         } catch (Exception e) {

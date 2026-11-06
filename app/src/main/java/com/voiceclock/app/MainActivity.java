@@ -16,12 +16,21 @@ import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
 import androidx.localbroadcastmanager.content.LocalBroadcastManager;
 
+import java.text.SimpleDateFormat;
+import java.util.Date;
+import java.util.Locale;
+
 public class MainActivity extends AppCompatActivity {
 
     private static final int PERMISSION_REQUEST_CODE = 100;
+    private static final int MAX_DEBUG_LINES = 50;
+
     private Button btnStartStop;
     private TextView tvStatus;
+    private TextView tvDebug;
     private boolean serviceRunning = false;
+    private StringBuilder debugLog = new StringBuilder();
+    private SimpleDateFormat timeFormat = new SimpleDateFormat("HH:mm:ss", Locale.getDefault());
 
     private BroadcastReceiver statusReceiver = new BroadcastReceiver() {
         @Override
@@ -32,6 +41,16 @@ public class MainActivity extends AppCompatActivity {
         }
     };
 
+    private BroadcastReceiver debugReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            String message = intent.getStringExtra(VoiceService.EXTRA_DEBUG);
+            if (message != null) {
+                appendDebug(message);
+            }
+        }
+    };
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -39,6 +58,7 @@ public class MainActivity extends AppCompatActivity {
 
         btnStartStop = findViewById(R.id.btnStartStop);
         tvStatus = findViewById(R.id.tvStatus);
+        tvDebug = findViewById(R.id.tvDebug);
 
         requestPermissions();
 
@@ -57,8 +77,10 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onResume() {
         super.onResume();
-        LocalBroadcastManager.getInstance(this).registerReceiver(
-                statusReceiver, new IntentFilter(VoiceService.ACTION_STATUS));
+        IntentFilter statusFilter = new IntentFilter(VoiceService.ACTION_STATUS);
+        IntentFilter debugFilter = new IntentFilter(VoiceService.ACTION_DEBUG);
+        LocalBroadcastManager.getInstance(this).registerReceiver(statusReceiver, statusFilter);
+        LocalBroadcastManager.getInstance(this).registerReceiver(debugReceiver, debugFilter);
         updateFromService();
     }
 
@@ -66,6 +88,7 @@ public class MainActivity extends AppCompatActivity {
     protected void onPause() {
         super.onPause();
         LocalBroadcastManager.getInstance(this).unregisterReceiver(statusReceiver);
+        LocalBroadcastManager.getInstance(this).unregisterReceiver(debugReceiver);
     }
 
     private void updateFromService() {
@@ -89,6 +112,9 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void startVoiceService() {
+        debugLog.setLength(0);
+        tvDebug.setText("");
+
         Intent intent = new Intent(this, VoiceService.class);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             startForegroundService(intent);
@@ -97,7 +123,7 @@ public class MainActivity extends AppCompatActivity {
         }
         serviceRunning = true;
         updateUI();
-        tvStatus.setText("\u670d\u52a1\u72b6\u6001\uff1a\u542f\u52a8\u4e2d...\n\u6b63\u5728\u52a0\u8f7d\u79bb\u7ebf\u8bed\u97f3\u6a21\u578b\uff0c\u8bf7\u7a0d\u5019...");
+        appendDebug("\u670d\u52a1\u542f\u52a8\u4e2d...");
     }
 
     private void stopVoiceService() {
@@ -105,6 +131,25 @@ public class MainActivity extends AppCompatActivity {
         stopService(intent);
         serviceRunning = false;
         updateUI();
+        appendDebug("\u670d\u52a1\u5df2\u505c\u6b62");
+    }
+
+    private void appendDebug(String message) {
+        String time = timeFormat.format(new Date());
+        String line = "[" + time + "] " + message + "\n";
+        debugLog.append(line);
+
+        // Keep only last N lines to avoid memory issues
+        String[] lines = debugLog.toString().split("\n");
+        if (lines.length > MAX_DEBUG_LINES) {
+            debugLog.setLength(0);
+            int start = lines.length - MAX_DEBUG_LINES;
+            for (int i = start; i < lines.length; i++) {
+                debugLog.append(lines[i]).append("\n");
+            }
+        }
+
+        tvDebug.setText(debugLog.toString());
     }
 
     private void updateStatusText(String status, String error) {
@@ -113,14 +158,14 @@ public class MainActivity extends AppCompatActivity {
         String text;
         switch (status) {
             case VoiceService.STATUS_LOADING:
-                text = "\u670d\u52a1\u72b6\u6001\uff1a\u52a0\u8f7d\u4e2d\n\u6b63\u5728\u52a0\u8f7d\u79bb\u7ebf\u8bed\u97f3\u6a21\u578b\uff0c\u8bf7\u7a0d\u5019...";
+                text = "\u670d\u52a1\u72b6\u6001\uff1a\u52a0\u8f7d\u4e2d";
                 break;
             case VoiceService.STATUS_READY:
             case VoiceService.STATUS_LISTENING:
-                text = "\u670d\u52a1\u72b6\u6001\uff1a\u8fd0\u884c\u4e2d\n\u79bb\u7ebf\u8bed\u97f3\u52a9\u624b\u6b63\u5728\u76d1\u542c...\n\u8bf4\u201c\u51e0\u70b9\u4e86\u201d\u83b7\u53d6\u5f53\u524d\u65f6\u95f4";
+                text = "\u670d\u52a1\u72b6\u6001\uff1a\u76d1\u542c\u4e2d";
                 break;
             case VoiceService.STATUS_ERROR:
-                text = "\u670d\u52a1\u72b6\u6001\uff1a\u9519\u8bef\n" + (error != null ? error : "\u672a\u77e5\u9519\u8bef");
+                text = "\u670d\u52a1\u72b6\u6001\uff1a\u9519\u8bef - " + (error != null ? error : "");
                 break;
             default:
                 text = "\u670d\u52a1\u72b6\u6001\uff1a" + status;
@@ -133,7 +178,7 @@ public class MainActivity extends AppCompatActivity {
             btnStartStop.setText("\u505c\u6b62\u670d\u52a1");
         } else {
             btnStartStop.setText("\u542f\u52a8\u670d\u52a1");
-            tvStatus.setText("\u670d\u52a1\u72b6\u6001\uff1a\u5df2\u505c\u6b62\n\u70b9\u51fb\u6309\u94ae\u542f\u52a8\u8bed\u97f3\u52a9\u624b");
+            tvStatus.setText("\u670d\u52a1\u72b6\u6001\uff1a\u5df2\u505c\u6b62");
         }
     }
 }
