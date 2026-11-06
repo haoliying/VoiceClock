@@ -5,11 +5,16 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.Service;
 import android.content.Intent;
+import android.media.AudioAttributes;
+import android.media.AudioFocusRequest;
+import android.media.AudioManager;
 import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
 import android.speech.tts.TextToSpeech;
+import android.speech.tts.TextToSpeech.OnInitListener;
+import android.speech.tts.UtteranceProgressListener;
 import android.util.Log;
 
 import androidx.core.app.NotificationCompat;
@@ -57,12 +62,16 @@ public class VoiceService extends Service {
     private Thread recognitionThread;
     private volatile boolean isListening = false;
     private volatile boolean modelReady = false;
+    private volatile boolean ttsReady = false;
     private String lastError = "";
+    private AudioManager audioManager;
+    private AudioFocusRequest audioFocusRequest;
 
     @Override
     public void onCreate() {
         super.onCreate();
         handler = new Handler(Looper.getMainLooper());
+        audioManager = (AudioManager) getSystemService(AUDIO_SERVICE);
         createNotificationChannel();
         initTTS();
         isRunning = true;
@@ -127,6 +136,20 @@ public class VoiceService extends Service {
                 }
 
                 broadcastDebug("[ok] \u97f3\u9891\u5f55\u5236\u521d\u59cb\u5316\u6210\u529f");
+
+                // Wait for TTS to be ready (up to 5 seconds)
+                broadcastDebug("[tts] \u7b49\u5f85\u8bed\u97f3\u5408\u6210\u5f15\u64ce\u5c31\u7eea...");
+                int waitCount = 0;
+                while (!ttsReady && waitCount < 50) {
+                    Thread.sleep(100);
+                    waitCount++;
+                }
+
+                if (!ttsReady) {
+                    broadcastDebug("[tts-warn] TTS \u5f15\u64ce\u672a\u5c31\u7eea\uff0c\u5c1d\u8bd5\u56de\u9000\u65b9\u6848...");
+                    initTTSFallback();
+                }
+
                 modelReady = true;
                 startRecognitionLoop();
                 broadcastStatus(STATUS_READY);
@@ -313,9 +336,6 @@ public class VoiceService extends Service {
 
     private boolean containsTimeQuery(String text) {
         if (text == null || text.isEmpty()) return false;
-        // \u51e0\u70b9\u4e86 = 几点了, \u51e0\u70b9\u5566 = 几点啦
-        // \u4ec0\u4e48\u65f6\u95f4 = 什么时间, \u73b0\u5728\u65f6\u95f4 = 现在时间
-        // \u51e0\u65f6 = 几时, \u51e0\u70b9 = 几点
         return text.contains("\u51e0\u70b9\u4e86")
                 || text.contains("\u51e0\u70b9\u5566")
                 || text.contains("\u4ec0\u4e48\u65f6\u95f4")
@@ -335,21 +355,21 @@ public class VoiceService extends Service {
         String text;
         switch (status) {
             case STATUS_LOADING:
-                text = "\u6b63\u5728\u52a0\u8f7d\u79bb\u7ebf\u6a21\u578b...";  // 正在加载离线模型...
+                text = "\u6b63\u5728\u52a0\u8f7d\u79bb\u7ebf\u6a21\u578b...";
                 break;
             case STATUS_READY:
             case STATUS_LISTENING:
-                text = "\u79bb\u7ebf\u76d1\u542c\u4e2d... \u8bf4\u201c\u51e0\u70b9\u4e86\u201d\u83b7\u53d6\u65f6\u95f4";  // 离线监听中... 说"几点了"获取时间
+                text = "\u79bb\u7ebf\u76d1\u542c\u4e2d... \u8bf4\u201c\u51e0\u70b9\u4e86\u201d\u83b7\u53d6\u65f6\u95f4";
                 break;
             case STATUS_ERROR:
-                text = "\u9519\u8bef: " + lastError;  // 错误: ...
+                text = "\u9519\u8bef: " + lastError;
                 break;
             default:
-                text = "\u8fd0\u884c\u4e2d";  // 运行中
+                text = "\u8fd0\u884c\u4e2d";
         }
 
         Notification notification = new NotificationCompat.Builder(this, CHANNEL_ID)
-                .setContentTitle("\u8bed\u97f3\u52a9\u624b")  // 语音助手
+                .setContentTitle("\u8bed\u97f3\u52a9\u624b")
                 .setContentText(text)
                 .setSmallIcon(R.drawable.ic_notification)
                 .setOngoing(true)
@@ -363,7 +383,7 @@ public class VoiceService extends Service {
 
     private Notification buildNotification(String text) {
         return new NotificationCompat.Builder(this, CHANNEL_ID)
-                .setContentTitle("\u8bed\u97f3\u52a9\u624b\u8fd0\u884c\u4e2d")  // 语音助手运行中
+                .setContentTitle("\u8bed\u97f3\u52a9\u624b\u8fd0\u884c\u4e2d")
                 .setContentText(text)
                 .setSmallIcon(R.drawable.ic_notification)
                 .setOngoing(true)
@@ -407,6 +427,7 @@ public class VoiceService extends Service {
             textToSpeech = null;
         }
 
+        abandonAudioFocus();
         handler.removeCallbacksAndMessages(null);
     }
 
@@ -419,10 +440,10 @@ public class VoiceService extends Service {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             NotificationChannel channel = new NotificationChannel(
                     CHANNEL_ID,
-                    "\u8bed\u97f3\u52a9\u624b",  // 语音助手
+                    "\u8bed\u97f3\u52a9\u624b",
                     NotificationManager.IMPORTANCE_LOW
             );
-            channel.setDescription("\u8bed\u97f3\u65f6\u949f\u52a9\u624b\u901a\u77e5");  // 语音时钟助手通知
+            channel.setDescription("\u8bed\u97f3\u65f6\u949f\u52a9\u624b\u901a\u77e5");
             NotificationManager manager = getSystemService(NotificationManager.class);
             if (manager != null) {
                 manager.createNotificationChannel(channel);
@@ -430,54 +451,221 @@ public class VoiceService extends Service {
         }
     }
 
+    // ========== TTS Management ==========
+
     private void initTTS() {
-        textToSpeech = new TextToSpeech(this, new TextToSpeech.OnInitListener() {
+        broadcastDebug("[tts] \u521d\u59cb\u5316\u8bed\u97f3\u5408\u6210\u5f15\u64ce...");
+
+        textToSpeech = new TextToSpeech(this, new OnInitListener() {
             @Override
             public void onInit(int status) {
                 if (status == TextToSpeech.SUCCESS) {
-                    int result = textToSpeech.setLanguage(Locale.CHINESE);
-                    if (result == TextToSpeech.LANG_MISSING_DATA
-                            || result == TextToSpeech.LANG_NOT_SUPPORTED) {
-                        Log.w(TAG, "Chinese TTS not available, trying default locale");
-                        textToSpeech.setLanguage(Locale.getDefault());
-                    } else {
-                        Log.d(TAG, "Chinese TTS initialized");
-                    }
+                    configureTTS(textToSpeech, "default");
                 } else {
+                    broadcastDebug("[tts-error] \u5f15\u64ce\u521d\u59cb\u5316\u5931\u8d25, status=" + status);
                     Log.e(TAG, "TTS init failed with status: " + status);
                 }
             }
         });
     }
 
+    private void initTTSFallback() {
+        broadcastDebug("[tts] \u5c1d\u8bd5\u56de\u9000\u65b9\u6848: \u4f7f\u7528\u82f1\u6587 TTS + \u6570\u5b57\u62a5\u65f6...");
+
+        if (textToSpeech != null) {
+            textToSpeech.shutdown();
+        }
+
+        // Try with English as fallback - numbers are universal
+        textToSpeech = new TextToSpeech(this, new OnInitListener() {
+            @Override
+            public void onInit(int status) {
+                if (status == TextToSpeech.SUCCESS) {
+                    int result = textToSpeech.setLanguage(Locale.ENGLISH);
+                    if (result != TextToSpeech.LANG_MISSING_DATA
+                            && result != TextToSpeech.LANG_NOT_SUPPORTED) {
+                        ttsReady = true;
+                        broadcastDebug("[tts-ok] \u82f1\u6587 TTS \u56de\u9000\u6210\u529f");
+                        setupTTSListeners();
+                    } else {
+                        broadcastDebug("[tts-error] \u82f1\u6587 TTS \u4e5f\u4e0d\u53ef\u7528");
+                    }
+                } else {
+                    broadcastDebug("[tts-error] \u56de\u9000\u5f15\u64ce\u4e5f\u5931\u8d25");
+                }
+            }
+        });
+    }
+
+    private void configureTTS(TextToSpeech tts, String engineName) {
+        broadcastDebug("[tts] \u914d\u7f6e " + engineName + " \u5f15\u64ce...");
+
+        // Try Chinese first
+        int result = tts.setLanguage(Locale.CHINESE);
+        broadcastDebug("[tts] setLanguage(CHINESE) = " + result);
+
+        if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
+            broadcastDebug("[tts-warn] \u4e2d\u6587\u8bed\u97f3\u6570\u636e\u7f3a\u5931\uff0c\u5c1d\u8bd5\u5176\u4ed6\u8bed\u8a00...");
+
+            // Try Simplified Chinese
+            result = tts.setLanguage(Locale.SIMPLIFIED_CHINESE);
+            broadcastDebug("[tts] setLanguage(SIMPLIFIED_CHINESE) = " + result);
+
+            if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
+                // Try Taiwan Chinese
+                result = tts.setLanguage(Locale.TRADITIONAL_CHINESE);
+                broadcastDebug("[tts] setLanguage(TRADITIONAL_CHINESE) = " + result);
+
+                if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
+                    // Last resort: try default locale
+                    result = tts.setLanguage(Locale.getDefault());
+                    broadcastDebug("[tts] setLanguage(default=" + Locale.getDefault().getDisplayName() + ") = " + result);
+
+                    if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
+                        broadcastDebug("[tts-error] \u65e0\u4efb\u4f55\u53ef\u7528\u8bed\u8a00\uff0cTTS \u4e0d\u53ef\u7528");
+                        ttsReady = false;
+                        return;
+                    }
+                }
+            }
+        }
+
+        ttsReady = true;
+        broadcastDebug("[tts-ok] \u8bed\u97f3\u5408\u6210\u5f15\u64ce\u5c31\u7eea (lang=" + tts.getLanguage().getDisplayName() + ")");
+        setupTTSListeners();
+    }
+
+    private void setupTTSListeners() {
+        if (textToSpeech == null) return;
+
+        textToSpeech.setOnUtteranceProgressListener(new UtteranceProgressListener() {
+            @Override
+            public void onStart(String utteranceId) {
+                Log.d(TAG, "TTS started: " + utteranceId);
+            }
+
+            @Override
+            public void onDone(String utteranceId) {
+                Log.d(TAG, "TTS done: " + utteranceId);
+                abandonAudioFocus();
+            }
+
+            @Override
+            public void onError(String utteranceId) {
+                Log.e(TAG, "TTS error: " + utteranceId);
+                broadcastDebug("[tts-error] \u64ad\u62a5\u5931\u8d25: " + utteranceId);
+                abandonAudioFocus();
+            }
+        });
+    }
+
+    private boolean requestAudioFocus() {
+        if (audioManager == null) return false;
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            AudioAttributes attrs = new AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build();
+
+            audioFocusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
+                    .setAudioAttributes(attrs)
+                    .setOnAudioFocusChangeListener(new AudioManager.OnAudioFocusChangeListener() {
+                        @Override
+                        public void onAudioFocusChange(int focusChange) {
+                            Log.d(TAG, "Audio focus changed: " + focusChange);
+                        }
+                    })
+                    .build();
+
+            int result = audioManager.requestAudioFocus(audioFocusRequest);
+            return result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED;
+        } else {
+            @SuppressWarnings("deprecation")
+            int result = audioManager.requestAudioFocus(
+                    new AudioManager.OnAudioFocusChangeListener() {
+                        @Override
+                        public void onAudioFocusChange(int focusChange) {
+                            Log.d(TAG, "Audio focus changed: " + focusChange);
+                        }
+                    },
+                    AudioManager.STREAM_MUSIC,
+                    AudioManager.AUDIOFOCUS_GAIN_TRANSIENT
+            );
+            return result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED;
+        }
+    }
+
+    private void abandonAudioFocus() {
+        if (audioManager == null) return;
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            if (audioFocusRequest != null) {
+                audioManager.abandonAudioFocusRequest(audioFocusRequest);
+            }
+        } else {
+            @SuppressWarnings("deprecation")
+            AudioManager.OnAudioFocusChangeListener listener = null;
+            audioManager.abandonAudioFocus(listener);
+        }
+    }
+
     private void speakTime() {
+        if (!ttsReady) {
+            broadcastDebug("[tts-error] TTS \u672a\u5c31\u7eea\uff0c\u65e0\u6cd5\u64ad\u62a5");
+            return;
+        }
+
+        if (!requestAudioFocus()) {
+            broadcastDebug("[tts-warn] \u97f3\u9891\u805a\u7126\u83b7\u53d6\u5931\u8d25");
+        }
+
         Calendar calendar = Calendar.getInstance();
         int hour = calendar.get(Calendar.HOUR_OF_DAY);
         int minute = calendar.get(Calendar.MINUTE);
 
         String period;
         if (hour < 6) {
-            period = "\u51cc\u6668";  // 凌晨
+            period = "\u51cc\u6668";
         } else if (hour < 12) {
-            period = "\u4e0a\u5348";  // 上午
+            period = "\u4e0a\u5348";
         } else if (hour < 14) {
-            period = "\u4e2d\u5348";  // 中午
+            period = "\u4e2d\u5348";
         } else if (hour < 18) {
-            period = "\u4e0b\u5348";  // 下午
+            period = "\u4e0b\u5348";
         } else {
-            period = "\u665a\u4e0a";  // 晚上
+            period = "\u665a\u4e0a";
         }
 
         int displayHour = hour % 12;
         if (displayHour == 0) displayHour = 12;
 
-        // \u73b0\u5728\u662f = 现在是, \u70b9 = 点, \u5206 = 分
-        String timeText = "\u73b0\u5728\u662f" + period + displayHour
-                + "\u70b9" + minute + "\u5206";
+        Locale ttsLocale = textToSpeech.getLanguage();
+        String timeText;
+
+        // Use Chinese if available, otherwise use English with numbers
+        if (ttsLocale != null && (ttsLocale.getLanguage().equals("zh")
+                || ttsLocale.equals(Locale.CHINESE)
+                || ttsLocale.equals(Locale.SIMPLIFIED_CHINESE)
+                || ttsLocale.equals(Locale.TRADITIONAL_CHINESE))) {
+            timeText = "\u73b0\u5728\u662f" + period + displayHour
+                    + "\u70b9" + minute + "\u5206";
+        } else {
+            // English fallback: "Now is 3:25"
+            timeText = "Now is " + displayHour + ":" + String.format("%02d", minute);
+        }
+
+        broadcastDebug("[tts] \u64ad\u62a5: " + timeText);
         Log.d(TAG, "Speaking: " + timeText);
 
-        if (textToSpeech != null) {
-            textToSpeech.speak(timeText, TextToSpeech.QUEUE_FLUSH, null, "time_announcement");
+        int speakResult = textToSpeech.speak(timeText, TextToSpeech.QUEUE_FLUSH, null, "time_announcement");
+
+        if (speakResult == TextToSpeech.SUCCESS) {
+            broadcastDebug("[tts-ok] \u64ad\u62a5\u6307\u4ee4\u5df2\u53d1\u9001");
+        } else if (speakResult == TextToSpeech.ERROR) {
+            broadcastDebug("[tts-error] speak() \u8fd4\u56de ERROR");
+        } else {
+            broadcastDebug("[tts-warn] speak() \u8fd4\u56de: " + speakResult);
         }
     }
 }
