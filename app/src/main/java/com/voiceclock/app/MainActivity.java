@@ -2,12 +2,15 @@ package com.voiceclock.app;
 
 import android.Manifest;
 import android.content.BroadcastReceiver;
+import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.ServiceConnection;
 import android.content.pm.PackageManager;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.IBinder;
 import android.view.View;
 import android.widget.Button;
 import android.widget.TextView;
@@ -29,19 +32,38 @@ public class MainActivity extends AppCompatActivity {
     private TextView tvStatus;
     private TextView tvDebug;
     private boolean serviceRunning = false;
-    private StringBuilder debugLog = new StringBuilder();
-    private SimpleDateFormat timeFormat = new SimpleDateFormat("HH:mm:ss", Locale.getDefault());
+    private boolean bound = false;
+    private final StringBuilder debugLog = new StringBuilder();
+    private final SimpleDateFormat timeFormat = new SimpleDateFormat("HH:mm:ss", Locale.getDefault());
 
-    private BroadcastReceiver statusReceiver = new BroadcastReceiver() {
+    private final ServiceConnection serviceConnection = new ServiceConnection() {
         @Override
-        public void onReceive(Context context, Intent intent) {
-            String status = intent.getStringExtra(VoiceService.EXTRA_STATUS);
-            String error = intent.getStringExtra("error");
-            updateStatusText(status, error);
+        public void onServiceConnected(ComponentName name, IBinder binder) {
+            serviceRunning = true;
+            refreshStatusText();
+            LocalBroadcastManager.getInstance(MainActivity.this)
+                    .sendBroadcast(new Intent(VoiceService.ACTION_REQUEST_STATUS));
+        }
+
+        @Override
+        public void onServiceDisconnected(ComponentName name) {
+            serviceRunning = false;
+            applyStatus(VoiceService.STATUS_STOPPED, "", "");
         }
     };
 
-    private BroadcastReceiver debugReceiver = new BroadcastReceiver() {
+    private final BroadcastReceiver statusReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            // 能收到服务的广播，说明服务一定还活着
+            serviceRunning = true;
+            applyStatus(intent.getStringExtra(VoiceService.EXTRA_STATUS),
+                    intent.getStringExtra(VoiceService.EXTRA_ERROR),
+                    intent.getStringExtra(VoiceService.EXTRA_DETAIL));
+        }
+    };
+
+    private final BroadcastReceiver debugReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
             String message = intent.getStringExtra(VoiceService.EXTRA_DEBUG);
@@ -77,11 +99,11 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onResume() {
         super.onResume();
-        IntentFilter statusFilter = new IntentFilter(VoiceService.ACTION_STATUS);
-        IntentFilter debugFilter = new IntentFilter(VoiceService.ACTION_DEBUG);
-        LocalBroadcastManager.getInstance(this).registerReceiver(statusReceiver, statusFilter);
-        LocalBroadcastManager.getInstance(this).registerReceiver(debugReceiver, debugFilter);
-        updateFromService();
+        LocalBroadcastManager.getInstance(this)
+                .registerReceiver(statusReceiver, new IntentFilter(VoiceService.ACTION_STATUS));
+        LocalBroadcastManager.getInstance(this)
+                .registerReceiver(debugReceiver, new IntentFilter(VoiceService.ACTION_DEBUG));
+        refreshServiceState();
     }
 
     @Override
@@ -89,15 +111,48 @@ public class MainActivity extends AppCompatActivity {
         super.onPause();
         LocalBroadcastManager.getInstance(this).unregisterReceiver(statusReceiver);
         LocalBroadcastManager.getInstance(this).unregisterReceiver(debugReceiver);
+        if (bound) {
+            try {
+                unbindService(serviceConnection);
+            } catch (Exception ignored) {
+                // 已经解绑
+            }
+            bound = false;
+        }
     }
 
-    private void updateFromService() {
-        serviceRunning = VoiceService.isRunning;
-        updateUI();
-        // Request a status update from the service if it's running
-        if (serviceRunning) {
-            Intent intent = new Intent(VoiceService.ACTION_REQUEST_STATUS);
-            LocalBroadcastManager.getInstance(this).sendBroadcast(intent);
+    /**
+     * 用绑定服务的方式确认服务是否真的在运行，绑定失败即表示服务没启动。
+     * 同时读取服务写入的状态，保证按钮和下面文字始终一致。
+     */
+    private void refreshServiceState() {
+        boolean alive;
+        try {
+            alive = bindService(new Intent(this, VoiceService.class), serviceConnection, 0);
+        } catch (Exception e) {
+            alive = false;
+        }
+
+        if (alive) {
+            bound = true;
+            serviceRunning = true;
+            refreshStatusText();
+            LocalBroadcastManager.getInstance(this)
+                    .sendBroadcast(new Intent(VoiceService.ACTION_REQUEST_STATUS));
+        } else {
+            bound = false;
+            serviceRunning = false;
+            applyStatus(VoiceService.STATUS_STOPPED, "", "");
+        }
+    }
+
+    /** 先用服务保存的状态占位，随后会收到服务的实时状态。 */
+    private void refreshStatusText() {
+        ServiceState.Snapshot snapshot = ServiceState.load(this);
+        if (snapshot.isFresh()) {
+            applyStatus(snapshot.status, snapshot.error, snapshot.detail);
+        } else {
+            applyStatus(VoiceService.STATUS_LOADING, "", "正在连接服务...");
         }
     }
 
@@ -117,26 +172,62 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void startVoiceService() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+                != PackageManager.PERMISSION_GRANTED) {
+            appendDebug("请先授予录音权限，再启动服务");
+            ActivityCompat.requestPermissions(this,
+                    new String[]{Manifest.permission.RECORD_AUDIO}, PERMISSION_REQUEST_CODE);
+            return;
+        }
+
         debugLog.setLength(0);
         tvDebug.setText("");
 
-        Intent intent = new Intent(this, VoiceService.class);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(intent);
-        } else {
-            startService(intent);
+        try {
+            Intent intent = new Intent(this, VoiceService.class);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(intent);
+            } else {
+                startService(intent);
+            }
+            serviceRunning = true;
+            applyStatus(VoiceService.STATUS_LOADING, "", "服务启动中...");
+            appendDebug("服务启动中...");
+        } catch (Exception e) {
+            serviceRunning = false;
+            applyStatus(VoiceService.STATUS_ERROR,
+                    e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName(), "");
+            appendDebug("启动失败: " + e.getMessage());
         }
-        serviceRunning = true;
-        updateUI();
-        appendDebug("\u670d\u52a1\u542f\u52a8\u4e2d...");
     }
 
     private void stopVoiceService() {
-        Intent intent = new Intent(this, VoiceService.class);
-        stopService(intent);
+        try {
+            stopService(new Intent(this, VoiceService.class));
+        } catch (Exception e) {
+            appendDebug("停止服务失败: " + e.getMessage());
+        }
         serviceRunning = false;
-        updateUI();
-        appendDebug("\u670d\u52a1\u5df2\u505c\u6b62");
+        ServiceState.save(this, false, VoiceService.STATUS_STOPPED, "", "");
+        applyStatus(VoiceService.STATUS_STOPPED, "", "");
+        appendDebug("服务已停止");
+    }
+
+    private void applyStatus(String status, String error, String detail) {
+        String text;
+        if (VoiceService.STATUS_LOADING.equals(status)) {
+            text = "服务状态：" + (detail != null && !detail.isEmpty() ? detail : "正在加载模型...");
+        } else if (VoiceService.STATUS_READY.equals(status)
+                || VoiceService.STATUS_LISTENING.equals(status)) {
+            text = "服务状态：监听中，说“几点了”试试";
+        } else if (VoiceService.STATUS_ERROR.equals(status)) {
+            text = "服务状态：出错 - " + (error != null ? error : "");
+        } else {
+            text = "服务状态：已停止";
+        }
+
+        tvStatus.setText(text);
+        btnStartStop.setText(serviceRunning ? "停止服务" : "启动服务");
     }
 
     private void appendDebug(String message) {
@@ -155,41 +246,5 @@ public class MainActivity extends AppCompatActivity {
         }
 
         tvDebug.setText(debugLog.toString());
-    }
-
-    private void updateStatusText(String status, String error) {
-        if (status == null) return;
-
-        String text;
-        switch (status) {
-            case VoiceService.STATUS_LOADING:
-                text = "\u670d\u52a1\u72b6\u6001\uff1a\u52a0\u8f7d\u4e2d";
-                break;
-            case VoiceService.STATUS_READY:
-            case VoiceService.STATUS_LISTENING:
-                text = "\u670d\u52a1\u72b6\u6001\uff1a\u76d1\u542c\u4e2d";
-                break;
-            case VoiceService.STATUS_ERROR:
-                text = "\u670d\u52a1\u72b6\u6001\uff1a\u9519\u8bef - " + (error != null ? error : "");
-                break;
-            default:
-                text = "\u670d\u52a1\u72b6\u6001\uff1a" + status;
-        }
-        tvStatus.setText(text);
-    }
-
-    private void updateUI() {
-        if (serviceRunning) {
-            btnStartStop.setText("\u505c\u6b62\u670d\u52a1");
-            // Don't reset status text here - let the broadcast receiver handle it
-            // Only set a default if status is empty
-            if (tvStatus.getText().toString().isEmpty() || 
-                tvStatus.getText().toString().contains("\u5df2\u505c\u6b62")) {
-                tvStatus.setText("\u670d\u52a1\u72b6\u6001\uff1a\u52a0\u8f7d\u4e2d...");
-            }
-        } else {
-            btnStartStop.setText("\u542f\u52a8\u670d\u52a1");
-            tvStatus.setText("\u670d\u52a1\u72b6\u6001\uff1a\u5df2\u505c\u6b62");
-        }
     }
 }
