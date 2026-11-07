@@ -13,7 +13,7 @@ import android.media.AudioFocusRequest;
 import android.media.AudioFormat;
 import android.media.AudioManager;
 import android.media.AudioRecord;
-import android.media.MediaPlayer;
+import android.media.AudioTrack;
 import android.media.MediaRecorder;
 import android.os.Build;
 import android.os.Handler;
@@ -24,17 +24,29 @@ import android.util.Log;
 import androidx.core.app.NotificationCompat;
 import androidx.localbroadcastmanager.content.LocalBroadcastManager;
 
+import com.k2fsa.sherpa.onnx.GeneratedAudio;
+import com.k2fsa.sherpa.onnx.OfflineTts;
+import com.k2fsa.sherpa.onnx.OfflineTtsConfig;
+import com.k2fsa.sherpa.onnx.OfflineTtsModelConfig;
+import com.k2fsa.sherpa.onnx.OfflineTtsVitsModelConfig;
+
 import org.json.JSONObject;
 import org.vosk.Model;
 import org.vosk.Recognizer;
+
+import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
+import org.apache.commons.compress.archivers.tar.TarArchiveInputStream;
+import org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream;
 
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.util.ArrayList;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.util.Calendar;
-import java.util.List;
 
 public class VoiceService extends Service {
 
@@ -60,23 +72,19 @@ public class VoiceService extends Service {
     private Recognizer recognizer;
     private AudioRecord audioRecord;
 
+    // SherpaOnnx (TTS)
+    private OfflineTts tts;
+    private int ttsSampleRate = 22050;
+
     private AudioManager audioManager;
     private AudioFocusRequest audioFocusRequest;
     private Handler handler;
     private Thread recognitionThread;
     private volatile boolean isListening = false;
     private volatile boolean modelReady = false;
+    private volatile boolean ttsReady = false;
     private String lastError = "";
     private String currentStatus = STATUS_LOADING;
-
-    // Audio clips for TTS
-    private MediaPlayer currentMediaPlayer;
-
-    // Clip name mapping for numbers
-    private static final String[] DIGIT_CLIPS = {
-        "zero", "one", "two", "three", "four",
-        "five", "six", "seven", "eight", "nine"
-    };
 
     private BroadcastReceiver statusRequestReceiver = new BroadcastReceiver() {
         @Override
@@ -107,8 +115,13 @@ public class VoiceService extends Service {
 
         new Thread(() -> {
             try {
+                // 1. Load Vosk model (speech recognition)
                 initVosk();
 
+                // 2. Load SherpaOnnx TTS model
+                initSherpaOnnxTts();
+
+                // 3. Init AudioRecord
                 if (!initAudioRecord()) {
                     lastError = "AudioRecord init failed";
                     broadcastDebug("[error] \u97f3\u9891\u5f55\u5236\u521d\u59cb\u5316\u5931\u8d25");
@@ -116,8 +129,7 @@ public class VoiceService extends Service {
                     return;
                 }
 
-                broadcastDebug("[ok] \u97f3\u9891\u5f55\u5236\u521d\u59cb\u5316\u6210\u529f");
-                broadcastDebug("[tts] \u97f3\u9891\u64ad\u62a5\u5c31\u7eea (\u5185\u7f6e\u97f3\u9891\u7247)");
+                broadcastDebug("[ok] \u5168\u90e8\u521d\u59cb\u5316\u6210\u529f");
                 modelReady = true;
                 startRecognitionLoop();
                 broadcastStatus(STATUS_READY);
@@ -156,119 +168,268 @@ public class VoiceService extends Service {
         broadcastDebug("[ok] \u8bed\u97f3\u8bc6\u522b\u5f15\u64ce\u5c31\u7eea (Vosk)");
     }
 
-    // ========== Audio Clip Playback ==========
+    // ========== SherpaOnnx TTS ==========
 
-    private synchronized void playClips(List<String> clipNames) {
-        if (clipNames == null || clipNames.isEmpty()) return;
+    private static final String TTS_MODEL_URL = "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-zh-hf-theresa.tar.bz2";
+
+    private void initSherpaOnnxTts() throws Exception {
+        broadcastDebug("[tts] \u521d\u59cb\u5316 SherpaOnnx TTS...");
+
+        String ttsModelDir = getFilesDir().getAbsolutePath() + "/tts-model";
+        File ttsDir = new File(ttsModelDir);
+        File markerFile = new File(ttsDir, ".ready");
+
+        if (!markerFile.exists()) {
+            // Check if model files already exist (from previous partial extraction)
+            String existingModel = findFile(ttsDir, ".onnx");
+            String existingTokens = findFile(ttsDir, "tokens");
+
+            if (existingModel != null && existingTokens != null) {
+                broadcastDebug("[tts] \u6a21\u578b\u6587\u4ef6\u5df2\u5b58\u5728\uff0c\u8df3\u8fc7\u4e0b\u8f7d");
+                // Create marker since files exist
+                markerFile.createNewFile();
+            } else {
+                broadcastDebug("[tts] \u6a21\u578b\u672a\u627e\u5230\uff0c\u5f00\u59cb\u4e0b\u8f7d...");
+
+                // Clean up any partial extraction
+                if (ttsDir.exists()) {
+                    deleteRecursive(ttsDir);
+                }
+
+                // Download model
+                File downloadFile = new File(getCacheDir(), "tts-model.tar.bz2");
+                if (downloadFile.exists()) downloadFile.delete();
+                
+                downloadModel(TTS_MODEL_URL, downloadFile);
+
+                // Extract model
+                broadcastDebug("[tts] \u89e3\u538b\u6a21\u578b\u6587\u4ef6...");
+                ttsDir.mkdirs();
+                extractTarBz2(downloadFile, ttsDir);
+                downloadFile.delete();
+
+                broadcastDebug("[tts] \u89e3\u538b\u5b8c\u6210\uff0c\u6b63\u5728\u68c0\u67e5\u6a21\u578b\u6587\u4ef6...");
+            }
+        }
+
+        // Find model files
+        String modelFile = findFile(ttsDir, ".onnx");
+        String lexiconFile = findFile(ttsDir, "lexicon");
+        String tokensFile = findFile(ttsDir, "tokens");
+
+        broadcastDebug("[tts] model: " + (modelFile != null ? modelFile : "NOT FOUND"));
+        broadcastDebug("[tts] lexicon: " + (lexiconFile != null ? lexiconFile : "NOT FOUND"));
+        broadcastDebug("[tts] tokens: " + (tokensFile != null ? tokensFile : "NOT FOUND"));
+
+        if (modelFile == null || tokensFile == null) {
+            if (markerFile.exists()) markerFile.delete();
+            throw new Exception("TTS model files not found. model=" + modelFile + " tokens=" + tokensFile);
+        }
+
+        // Build config using the official API structure
+        broadcastDebug("[tts] \u521b\u5efa TTS \u914d\u7f6e...");
+
+        OfflineTtsVitsModelConfig vitsConfig = new OfflineTtsVitsModelConfig();
+        vitsConfig.model = modelFile;
+        vitsConfig.lexicon = lexiconFile != null ? lexiconFile : "";
+        vitsConfig.tokens = tokensFile;
+        vitsConfig.noiseScale = 0.667f;
+        vitsConfig.noiseScaleW = 0.8f;
+        vitsConfig.lengthScale = 1.0f;
+
+        OfflineTtsModelConfig modelConfig = new OfflineTtsModelConfig();
+        modelConfig.vits = vitsConfig;
+        modelConfig.numThreads = 2;
+        modelConfig.debug = true;
+        modelConfig.provider = "cpu";
+
+        OfflineTtsConfig config = new OfflineTtsConfig();
+        config.model = modelConfig;
+        config.maxNumSentences = 1;
+
+        broadcastDebug("[tts] \u521d\u59cb\u5316 OfflineTts \u5f15\u64ce...");
+        
+        try {
+            tts = new OfflineTts(config);
+            ttsSampleRate = tts.getSampleRate();
+            broadcastDebug("[tts] OfflineTts \u521d\u59cb\u5316\u6210\u529f, sampleRate=" + ttsSampleRate);
+        } catch (Exception e) {
+            broadcastDebug("[tts-error] OfflineTts \u521d\u59cb\u5316\u5931\u8d25: " + e.getMessage());
+            Log.e(TAG, "TTS init failed", e);
+            if (markerFile.exists()) markerFile.delete();
+            throw e;
+        }
+
+        // Mark as ready only after successful initialization
+        if (!markerFile.exists()) {
+            markerFile.createNewFile();
+        }
+
+        ttsReady = true;
+        broadcastDebug("[tts-ok] SherpaOnnx TTS \u5c31\u7eea");
+    }
+
+    private void downloadModel(String urlStr, File destFile) throws IOException {
+        broadcastDebug("[tts] \u4e0b\u8f7d\u4e2d: " + urlStr);
+
+        URL url = new URL(urlStr);
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+        conn.setConnectTimeout(30000);
+        conn.setReadTimeout(120000);
+        conn.setRequestProperty("User-Agent", "VoiceClock/1.0");
+        conn.setInstanceFollowRedirects(true);
+
+        int responseCode = conn.getResponseCode();
+        if (responseCode != HttpURLConnection.HTTP_OK) {
+            conn.disconnect();
+            throw new IOException("HTTP " + responseCode + " downloading model");
+        }
+
+        int totalSize = conn.getContentLength();
+        broadcastDebug("[tts] \u6587\u4ef6\u5927\u5c0f: " + (totalSize / 1024 / 1024) + "MB");
+
+        InputStream in = conn.getInputStream();
+        FileOutputStream out = new FileOutputStream(destFile);
+
+        byte[] buffer = new byte[65536];
+        int bytesRead;
+        long totalRead = 0;
+        int lastPercent = 0;
+
+        while ((bytesRead = in.read(buffer)) != -1) {
+            out.write(buffer, 0, bytesRead);
+            totalRead += bytesRead;
+
+            if (totalSize > 0) {
+                int percent = (int) (totalRead * 100 / totalSize);
+                if (percent >= lastPercent + 10) {
+                    broadcastDebug("[tts] \u4e0b\u8f7d\u8fdb\u5ea6: " + percent + "%");
+                    lastPercent = percent;
+                }
+            }
+        }
+
+        in.close();
+        out.close();
+        conn.disconnect();
+
+        broadcastDebug("[tts] \u4e0b\u8f7d\u5b8c\u6210: " + (totalRead / 1024 / 1024) + "MB");
+    }
+
+    private void extractTarBz2(File tarBz2File, File destDir) throws IOException {
+        InputStream fi = new java.io.FileInputStream(tarBz2File);
+        BZip2CompressorInputStream bzIn = new BZip2CompressorInputStream(fi);
+        TarArchiveInputStream tarIn = new TarArchiveInputStream(bzIn);
+
+        TarArchiveEntry entry;
+        int fileCount = 0;
+
+        while ((entry = tarIn.getNextTarEntry()) != null) {
+            if (entry.isDirectory()) {
+                continue;
+            }
+
+            // Strip the first directory component
+            String entryName = entry.getName();
+            int slashIndex = entryName.indexOf('/');
+            if (slashIndex >= 0) {
+                entryName = entryName.substring(slashIndex + 1);
+            }
+
+            if (entryName.isEmpty()) continue;
+
+            File outputFile = new File(destDir, entryName);
+            outputFile.getParentFile().mkdirs();
+
+            FileOutputStream out = new FileOutputStream(outputFile);
+            byte[] buffer = new byte[8192];
+            int len;
+            while ((len = tarIn.read(buffer)) != -1) {
+                out.write(buffer, 0, len);
+            }
+            out.close();
+            fileCount++;
+        }
+
+        tarIn.close();
+        bzIn.close();
+        fi.close();
+
+        broadcastDebug("[tts] \u89e3\u538b\u5b8c\u6210: " + fileCount + " \u4e2a\u6587\u4ef6");
+    }
+
+    private String findFile(File dir, String suffix) {
+        if (!dir.exists() || !dir.isDirectory()) return null;
+        File[] files = dir.listFiles();
+        if (files == null) return null;
+
+        for (File f : files) {
+            if (f.getName().equals(suffix) || f.getName().endsWith(suffix)) {
+                return f.getAbsolutePath();
+            }
+        }
+
+        for (File f : files) {
+            if (f.isDirectory()) {
+                String result = findFile(f, suffix);
+                if (result != null) return result;
+            }
+        }
+        return null;
+    }
+
+    // ========== Audio Playback ==========
+
+    private void playAudio(float[] samples, int sampleRate) {
+        if (samples == null || samples.length == 0) return;
+
+        short[] shortSamples = new short[samples.length];
+        for (int i = 0; i < samples.length; i++) {
+            float s = Math.max(-1.0f, Math.min(1.0f, samples[i]));
+            shortSamples[i] = (short) (s * Short.MAX_VALUE);
+        }
+
+        byte[] audioBytes = new byte[shortSamples.length * 2];
+        ByteBuffer.wrap(audioBytes).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().put(shortSamples);
+
+        int bufferSize = AudioTrack.getMinBufferSize(
+                sampleRate,
+                AudioFormat.CHANNEL_OUT_MONO,
+                AudioFormat.ENCODING_PCM_16BIT
+        );
+
+        AudioAttributes attrs = new AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_MEDIA)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                .build();
+
+        AudioFormat format = new AudioFormat.Builder()
+                .setSampleRate(sampleRate)
+                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                .build();
+
+        AudioTrack audioTrack = new AudioTrack(
+                attrs,
+                format,
+                Math.max(bufferSize, audioBytes.length),
+                AudioTrack.MODE_STREAM,
+                AudioManager.AUDIO_SESSION_ID_GENERATE
+        );
 
         requestAudioFocus();
-        playClipsSequential(clipNames, 0);
-    }
-
-    private void playClipsSequential(final List<String> clipNames, final int index) {
-        if (index >= clipNames.size()) {
-            abandonAudioFocus();
-            broadcastDebug("[tts-ok] \u64ad\u62a5\u5b8c\u6210");
-            return;
-        }
-
-        String clipName = clipNames.get(index);
-        int resId = getResources().getIdentifier(clipName, "raw", getPackageName());
-
-        if (resId == 0) {
-            // Try assets fallback
-            broadcastDebug("[tts] \u64ad\u62a5\u97f3\u9891: " + clipName + " (assets)");
-            playFromAssets(clipName, clipNames, index);
-            return;
-        }
+        audioTrack.play();
+        audioTrack.write(audioBytes, 0, audioBytes.length);
 
         try {
-            if (currentMediaPlayer != null) {
-                currentMediaPlayer.release();
-                currentMediaPlayer = null;
-            }
-
-            currentMediaPlayer = MediaPlayer.create(this, resId);
-            if (currentMediaPlayer == null) {
-                broadcastDebug("[tts-error] \u65e0\u6cd5\u521b\u5efa MediaPlayer: " + clipName);
-                playClipsSequential(clipNames, index + 1);
-                return;
-            }
-
-            currentMediaPlayer.setOnCompletionListener(mp -> {
-                mp.release();
-                if (currentMediaPlayer == mp) {
-                    currentMediaPlayer = null;
-                }
-                playClipsSequential(clipNames, index + 1);
-            });
-
-            currentMediaPlayer.setOnErrorListener((mp, what, extra) -> {
-                broadcastDebug("[tts-error] \u64ad\u653e\u9519\u8bef: " + clipName + " what=" + what);
-                mp.release();
-                if (currentMediaPlayer == mp) {
-                    currentMediaPlayer = null;
-                }
-                playClipsSequential(clipNames, index + 1);
-                return true;
-            });
-
-            currentMediaPlayer.start();
-        } catch (Exception e) {
-            broadcastDebug("[tts-error] \u64ad\u653e\u5931\u8d25: " + clipName + " - " + e.getMessage());
-            playClipsSequential(clipNames, index + 1);
+            Thread.sleep((long) (samples.length * 1000.0 / sampleRate) + 200);
+        } catch (InterruptedException e) {
+            // ignore
         }
-    }
 
-    private void playFromAssets(String clipName, final List<String> clipNames, final int index) {
-        try {
-            String assetPath = "tts/" + clipName + ".mp3";
-            InputStream is = getAssets().open(assetPath);
-            
-            // Copy to temp file for MediaPlayer
-            File tempFile = new File(getCacheDir(), clipName + ".mp3");
-            FileOutputStream fos = new FileOutputStream(tempFile);
-            byte[] buffer = new byte[4096];
-            int read;
-            while ((read = is.read(buffer)) != -1) {
-                fos.write(buffer, 0, read);
-            }
-            is.close();
-            fos.close();
-
-            if (currentMediaPlayer != null) {
-                currentMediaPlayer.release();
-                currentMediaPlayer = null;
-            }
-
-            currentMediaPlayer = new MediaPlayer();
-            currentMediaPlayer.setDataSource(tempFile.getAbsolutePath());
-            currentMediaPlayer.prepare();
-
-            currentMediaPlayer.setOnCompletionListener(mp -> {
-                mp.release();
-                if (currentMediaPlayer == mp) {
-                    currentMediaPlayer = null;
-                }
-                tempFile.delete();
-                playClipsSequential(clipNames, index + 1);
-            });
-
-            currentMediaPlayer.setOnErrorListener((mp, what, extra) -> {
-                mp.release();
-                if (currentMediaPlayer == mp) {
-                    currentMediaPlayer = null;
-                }
-                tempFile.delete();
-                playClipsSequential(clipNames, index + 1);
-                return true;
-            });
-
-            currentMediaPlayer.start();
-        } catch (Exception e) {
-            broadcastDebug("[tts-error] assets\u64ad\u653e\u5931\u8d25: " + clipName + " - " + e.getMessage());
-            playClipsSequential(clipNames, index + 1);
-        }
+        audioTrack.stop();
+        audioTrack.release();
+        abandonAudioFocus();
     }
 
     // ========== Audio Focus ==========
@@ -391,87 +552,46 @@ public class VoiceService extends Service {
                 || text.contains("\u51e0\u65f6") || text.contains("\u51e0\u70b9");
     }
 
-    // ========== Speak Time (using audio clips) ==========
+    // ========== Speak Time ==========
 
     private void speakTime() {
+        if (!ttsReady || tts == null) {
+            broadcastDebug("[tts-error] TTS \u672a\u5c31\u7eea");
+            return;
+        }
+
         Calendar calendar = Calendar.getInstance();
         int hour = calendar.get(Calendar.HOUR_OF_DAY);
         int minute = calendar.get(Calendar.MINUTE);
 
+        String period;
+        if (hour < 6) period = "\u51cc\u6668";
+        else if (hour < 12) period = "\u4e0a\u5348";
+        else if (hour < 14) period = "\u4e2d\u5348";
+        else if (hour < 18) period = "\u4e0b\u5348";
+        else period = "\u665a\u4e0a";
+
         int displayHour = hour % 12;
         if (displayHour == 0) displayHour = 12;
 
-        // Build clip sequence
-        List<String> clips = new ArrayList<>();
-        clips.add("now");   // 现在
-        clips.add("is");    // 是
-
-        // Period
-        String period;
-        if (hour < 6) { period = "dawn"; }        // 凌晨
-        else if (hour < 12) { period = "morning"; } // 上午
-        else if (hour < 14) { period = "noon"; }    // 中午
-        else if (hour < 18) { period = "afternoon"; } // 下午
-        else { period = "evening"; }                  // 晚上
-        clips.add(period);
-
-        // Hour digits
-        addNumberClips(clips, displayHour);
-        clips.add("oclock"); // 点
-
-        // Minute digits
-        addNumberClips(clips, minute);
-        clips.add("minute"); // 分
-
-        String timeText = "\u73b0\u5728\u662f" + getPeriodChinese(hour) + 
-                          getNumberChinese(displayHour) + "\u70b9" + 
-                          getNumberChinese(minute) + "\u5206";
+        String timeText = "\u73b0\u5728\u662f" + period + displayHour + "\u70b9" + minute + "\u5206";
         broadcastDebug("[tts] \u64ad\u62a5: " + timeText);
 
-        playClips(clips);
-    }
-
-    private void addNumberClips(List<String> clips, int num) {
-        if (num == 0) {
-            clips.add("zero");
-        } else if (num < 10) {
-            clips.add(DIGIT_CLIPS[num]);
-        } else if (num == 10) {
-            clips.add("ten");
-        } else if (num < 20) {
-            clips.add("ten");
-            clips.add(DIGIT_CLIPS[num - 10]);
-        } else {
-            int tens = num / 10;
-            int ones = num % 10;
-            clips.add(DIGIT_CLIPS[tens]);
-            clips.add("ten");
-            if (ones > 0) {
-                clips.add(DIGIT_CLIPS[ones]);
+        new Thread(() -> {
+            try {
+                GeneratedAudio audio = tts.generate(timeText);
+                if (audio != null && audio.getSamples() != null && audio.getSamples().length > 0) {
+                    broadcastDebug("[tts-ok] \u751f\u6210\u97f3\u9891 " + audio.getSamples().length + " \u91c7\u6837\u70b9");
+                    playAudio(audio.getSamples(), audio.getSampleRate());
+                    broadcastDebug("[tts-ok] \u64ad\u62a5\u5b8c\u6210");
+                } else {
+                    broadcastDebug("[tts-error] \u751f\u6210\u97f3\u9891\u5931\u8d25");
+                }
+            } catch (Exception e) {
+                broadcastDebug("[tts-error] " + e.getMessage());
+                Log.e(TAG, "TTS error", e);
             }
-        }
-    }
-
-    private String getPeriodChinese(int hour) {
-        if (hour < 6) return "\u51cc\u6668";
-        else if (hour < 12) return "\u4e0a\u5348";
-        else if (hour < 14) return "\u4e2d\u5348";
-        else if (hour < 18) return "\u4e0b\u5348";
-        else return "\u665a\u4e0a";
-    }
-
-    private String getNumberChinese(int num) {
-        String[] digits = {"\u96f6", "\u4e00", "\u4e8c", "\u4e09", "\u56db",
-                          "\u4e94", "\u516d", "\u4e03", "\u516b", "\u4e5d"};
-        if (num == 0) return digits[0];
-        else if (num < 10) return digits[num];
-        else if (num == 10) return "\u5341";
-        else if (num < 20) return "\u5341" + digits[num - 10];
-        else {
-            int tens = num / 10;
-            int ones = num % 10;
-            return digits[tens] + "\u5341" + (ones > 0 ? digits[ones] : "");
-        }
+        }).start();
     }
 
     // ========== File Operations ==========
@@ -585,16 +705,11 @@ public class VoiceService extends Service {
         isRunning = false;
         isListening = false;
         modelReady = false;
+        ttsReady = false;
 
         try {
             LocalBroadcastManager.getInstance(this).unregisterReceiver(statusRequestReceiver);
         } catch (Exception e) { /* ignore */ }
-
-        if (currentMediaPlayer != null) {
-            try { currentMediaPlayer.stop(); } catch (Exception e) { /* ignore */ }
-            currentMediaPlayer.release();
-            currentMediaPlayer = null;
-        }
 
         if (audioRecord != null) {
             try { audioRecord.stop(); } catch (Exception e) { /* ignore */ }
@@ -607,6 +722,7 @@ public class VoiceService extends Service {
         }
         if (recognizer != null) { recognizer.close(); recognizer = null; }
         if (voskModel != null) { voskModel.close(); voskModel = null; }
+        if (tts != null) { tts.release(); tts = null; }
         abandonAudioFocus();
         handler.removeCallbacksAndMessages(null);
     }
