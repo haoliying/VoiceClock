@@ -489,6 +489,9 @@ public class VoiceService extends Service {
 
         int fileCount = 0;
         int lastPercent = -1;
+        long writtenBytes = 0;
+        long lastProgressAt = 0;
+        long lastLogAt = 0;
         CountingInputStream counting = null;
         BZip2CompressorInputStream bzIn = null;
         TarArchiveInputStream tarIn = null;
@@ -515,21 +518,32 @@ public class VoiceService extends Service {
                 try {
                     byte[] buffer = new byte[64 * 1024];
                     int len;
+                    // 进度必须按字节更新：最大的 onnx 是一个 117MB 的单独条目，
+                    // 如果只在文件之间更新，解压期间进度会一直停在上一个文件的位置
                     while ((len = tarIn.read(buffer)) != -1) {
                         out.write(buffer, 0, len);
+                        writtenBytes += len;
+
+                        if (archiveSize > 0) {
+                            int percent = (int) (counting.count * 100 / archiveSize);
+                            long now = SystemClock.elapsedRealtime();
+                            if (percent >= lastPercent + 1 || now - lastProgressAt >= 2000) {
+                                lastPercent = percent;
+                                lastProgressAt = now;
+                                setLoadingDetail("正在解压语音模型 " + Math.min(percent, 100)
+                                        + "%（已写入 " + (writtenBytes / 1024 / 1024) + "MB）");
+                            }
+                            if (now - lastLogAt >= 10000) {
+                                lastLogAt = now;
+                                broadcastDebug("[tts] 解压 " + Math.min(percent, 100) + "%（"
+                                        + (writtenBytes / 1024 / 1024) + "MB）");
+                            }
+                        }
                     }
                 } finally {
                     out.close();
                 }
                 fileCount++;
-
-                if (archiveSize > 0) {
-                    int percent = (int) (counting.count * 100 / archiveSize);
-                    if (percent >= lastPercent + 2) {
-                        lastPercent = percent;
-                        setLoadingDetail("正在解压语音模型 " + Math.min(percent, 100) + "%");
-                    }
-                }
             }
         } finally {
             closeQuietly(tarIn);
