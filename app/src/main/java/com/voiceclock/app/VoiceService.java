@@ -7,19 +7,25 @@ import android.app.Service;
 import android.content.Intent;
 import android.media.AudioAttributes;
 import android.media.AudioFocusRequest;
+import android.media.AudioFormat;
 import android.media.AudioManager;
+import android.media.AudioRecord;
+import android.media.AudioTrack;
+import android.media.MediaRecorder;
 import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
-import android.speech.tts.TextToSpeech;
-import android.speech.tts.TextToSpeech.EngineInfo;
-import android.speech.tts.TextToSpeech.OnInitListener;
-import android.speech.tts.UtteranceProgressListener;
 import android.util.Log;
 
 import androidx.core.app.NotificationCompat;
 import androidx.localbroadcastmanager.content.LocalBroadcastManager;
+
+import com.k2fsa.sherpa.onnx.GeneratedAudio;
+import com.k2fsa.sherpa.onnx.OfflineTts;
+import com.k2fsa.sherpa.onnx.OfflineTtsConfig;
+import com.k2fsa.sherpa.onnx.OfflineTtsModelConfig;
+import com.k2fsa.sherpa.onnx.OfflineTtsVitsModelConfig;
 
 import org.json.JSONObject;
 
@@ -27,12 +33,15 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.util.Calendar;
-import java.util.Locale;
 
-import android.media.AudioFormat;
-import android.media.AudioRecord;
-import android.media.MediaRecorder;
+import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
+import org.apache.commons.compress.archivers.tar.TarArchiveInputStream;
+import org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream;
 
 import org.vosk.Model;
 import org.vosk.Recognizer;
@@ -55,18 +64,23 @@ public class VoiceService extends Service {
 
     public static boolean isRunning = false;
 
+    // Vosk (speech recognition)
     private Model voskModel;
     private Recognizer recognizer;
     private AudioRecord audioRecord;
-    private TextToSpeech textToSpeech;
+
+    // SherpaOnnx (TTS)
+    private OfflineTts tts;
+    private int ttsSampleRate = 22050;
+
+    private AudioManager audioManager;
+    private AudioFocusRequest audioFocusRequest;
     private Handler handler;
     private Thread recognitionThread;
     private volatile boolean isListening = false;
     private volatile boolean modelReady = false;
     private volatile boolean ttsReady = false;
     private String lastError = "";
-    private AudioManager audioManager;
-    private AudioFocusRequest audioFocusRequest;
 
     @Override
     public void onCreate() {
@@ -74,120 +88,484 @@ public class VoiceService extends Service {
         handler = new Handler(Looper.getMainLooper());
         audioManager = (AudioManager) getSystemService(AUDIO_SERVICE);
         createNotificationChannel();
-        initTTS();
         isRunning = true;
-        loadModelAndStart();
+        initAll();
     }
 
-    private void broadcastStatus(String status) {
-        Intent intent = new Intent(ACTION_STATUS);
-        intent.putExtra(EXTRA_STATUS, status);
-        intent.putExtra("error", lastError);
-        LocalBroadcastManager.getInstance(this).sendBroadcast(intent);
-        updateNotification(status);
-    }
-
-    private void broadcastDebug(String message) {
-        Intent intent = new Intent(ACTION_DEBUG);
-        intent.putExtra(EXTRA_DEBUG, message);
-        LocalBroadcastManager.getInstance(this).sendBroadcast(intent);
-    }
-
-    private void loadModelAndStart() {
+    private void initAll() {
         broadcastStatus(STATUS_LOADING);
-        broadcastDebug("[init] \u5f00\u59cb\u52a0\u8f7d\u79bb\u7ebf\u6a21\u578b...");
+        broadcastDebug("[init] \u521d\u59cb\u5316\u4e2d...");
+
         new Thread(() -> {
             try {
-                Log.d(TAG, "Starting model load...");
+                // 1. Copy and load Vosk model (speech recognition)
+                initVosk();
 
-                String modelPath = getFilesDir().getAbsolutePath() + "/vosk-model";
-                File modelDir = new File(modelPath);
-                File markerFile = new File(modelDir, ".ready");
+                // 2. Copy and load SherpaOnnx TTS model
+                initSherpaOnnxTts();
 
-                if (!markerFile.exists()) {
-                    broadcastDebug("[init] \u6b63\u5728\u590d\u5236\u6a21\u578b\u6587\u4ef6...");
-                    Log.d(TAG, "Copying model from assets to internal storage...");
-                    if (modelDir.exists()) {
-                        deleteRecursive(modelDir);
-                    }
-                    modelDir.mkdirs();
-                    copyAssetFolder("model", modelPath);
-                    markerFile.createNewFile();
-                    broadcastDebug("[init] \u6a21\u578b\u590d\u5236\u5b8c\u6210");
-                    Log.d(TAG, "Model copy complete");
-                } else {
-                    Log.d(TAG, "Model already copied, skipping");
-                }
-
-                broadcastDebug("[init] \u6b63\u5728\u52a0\u8f7d Vosk \u6a21\u578b...");
-                Log.d(TAG, "Loading Vosk model from: " + modelPath);
-                voskModel = new Model(modelPath);
-                broadcastDebug("[ok] Vosk \u6a21\u578b\u52a0\u8f7d\u6210\u529f");
-                Log.d(TAG, "Vosk model loaded successfully");
-
-                recognizer = new Recognizer(voskModel, SAMPLE_RATE);
-                Log.d(TAG, "Recognizer created at sample rate: " + SAMPLE_RATE);
-
+                // 3. Init AudioRecord
                 if (!initAudioRecord()) {
                     lastError = "AudioRecord init failed";
                     broadcastDebug("[error] \u97f3\u9891\u5f55\u5236\u521d\u59cb\u5316\u5931\u8d25");
-                    Log.e(TAG, "AudioRecord initialization failed!");
                     broadcastStatus(STATUS_ERROR);
                     return;
                 }
 
                 broadcastDebug("[ok] \u97f3\u9891\u5f55\u5236\u521d\u59cb\u5316\u6210\u529f");
-
-                // Wait for TTS to be ready (up to 15 seconds, trying multiple engines)
-                broadcastDebug("[tts] \u7b49\u5f85\u8bed\u97f3\u5408\u6210\u5f15\u64ce\u5c31\u7eea...");
-                int waitCount = 0;
-                while (!ttsReady && waitCount < 150) {
-                    Thread.sleep(100);
-                    waitCount++;
-                }
-
-                if (!ttsReady) {
-                    broadcastDebug("[tts-warn] TTS \u5f15\u64ce\u672a\u5c31\u7eea\uff0c\u5c06\u5728\u540e\u53f0\u7ee7\u7eed\u5c1d\u8bd5...");
-                }
-
                 modelReady = true;
                 startRecognitionLoop();
                 broadcastStatus(STATUS_READY);
                 broadcastDebug("[ready] \u5df2\u5c31\u7eea\uff0c\u5f00\u59cb\u76d1\u542c...\u8bf7\u8bf4\u8bdd");
-                Log.d(TAG, "Voice service fully started and listening");
 
             } catch (Exception e) {
                 lastError = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
                 broadcastDebug("[error] " + lastError);
-                Log.e(TAG, "Failed to start voice service: " + lastError, e);
+                Log.e(TAG, "Failed to start: " + lastError, e);
                 broadcastStatus(STATUS_ERROR);
             }
         }).start();
     }
 
+    // ========== Vosk (Speech Recognition) ==========
+
+    private void initVosk() throws Exception {
+        broadcastDebug("[init] \u52a0\u8f7d\u8bed\u97f3\u8bc6\u522b\u6a21\u578b...");
+
+        String modelPath = getFilesDir().getAbsolutePath() + "/vosk-model";
+        File modelDir = new File(modelPath);
+        File markerFile = new File(modelDir, ".ready");
+
+        if (!markerFile.exists()) {
+            broadcastDebug("[init] \u590d\u5236\u8bc6\u522b\u6a21\u578b\u6587\u4ef6...");
+            if (modelDir.exists()) {
+                deleteRecursive(modelDir);
+            }
+            modelDir.mkdirs();
+            copyAssetFolder("model", modelPath);
+            markerFile.createNewFile();
+        }
+
+        voskModel = new Model(modelPath);
+        recognizer = new Recognizer(voskModel, SAMPLE_RATE);
+        broadcastDebug("[ok] \u8bed\u97f3\u8bc6\u522b\u5f15\u64ce\u5c31\u7eea (Vosk)");
+    }
+
+    // ========== SherpaOnnx TTS ==========
+
+    private static final String TTS_MODEL_URL = "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-zh-hf-theresa.tar.bz2";
+
+    private void initSherpaOnnxTts() throws Exception {
+        broadcastDebug("[tts] \u521d\u59cb\u5316 SherpaOnnx \u79bb\u7ebf TTS...");
+
+        String ttsModelDir = getFilesDir().getAbsolutePath() + "/tts-model";
+        File ttsDir = new File(ttsModelDir);
+        File markerFile = new File(ttsDir, ".ready");
+
+        if (!markerFile.exists()) {
+            broadcastDebug("[tts] \u6a21\u578b\u672a\u627e\u5230\uff0c\u5f00\u59cb\u4e0b\u8f7d...");
+            
+            // Download model
+            File downloadFile = new File(getCacheDir(), "tts-model.tar.bz2");
+            downloadModel(TTS_MODEL_URL, downloadFile);
+            
+            // Extract model
+            broadcastDebug("[tts] \u89e3\u538b\u6a21\u578b\u6587\u4ef6...");
+            if (ttsDir.exists()) {
+                deleteRecursive(ttsDir);
+            }
+            ttsDir.mkdirs();
+            extractTarBz2(downloadFile, ttsDir);
+            downloadFile.delete();
+            
+            markerFile.createNewFile();
+            broadcastDebug("[tts] \u6a21\u578b\u4e0b\u8f7d\u5e76\u89e3\u538b\u5b8c\u6210");
+        }
+
+        // Find model files
+        String modelFile = findFile(ttsDir, ".onnx");
+        String lexiconFile = findFile(ttsDir, "lexicon");
+        String tokensFile = findFile(ttsDir, "tokens");
+
+        broadcastDebug("[tts] model: " + (modelFile != null ? new File(modelFile).getName() : "NOT FOUND"));
+        broadcastDebug("[tts] lexicon: " + (lexiconFile != null ? new File(lexiconFile).getName() : "NOT FOUND"));
+        broadcastDebug("[tts] tokens: " + (tokensFile != null ? new File(tokensFile).getName() : "NOT FOUND"));
+
+        if (modelFile == null || tokensFile == null) {
+            throw new Exception("TTS model files not found after download");
+        }
+
+        OfflineTtsVitsModelConfig vitsConfig = OfflineTtsVitsModelConfig.builder()
+                .setModel(modelFile)
+                .setLexicon(lexiconFile != null ? lexiconFile : "")
+                .setTokens(tokensFile)
+                .setNoiseScale(0.667f)
+                .setNoiseScaleW(0.8f)
+                .setLengthScale(1.0f)
+                .build();
+
+        OfflineTtsModelConfig modelConfig = OfflineTtsModelConfig.builder()
+                .setVits(vitsConfig)
+                .setNumThreads(2)
+                .setDebug(false)
+                .setProvider("cpu")
+                .build();
+
+        OfflineTtsConfig config = OfflineTtsConfig.builder()
+                .setModel(modelConfig)
+                .setMaxNumSentences(1)
+                .build();
+
+        tts = new OfflineTts(config);
+        ttsSampleRate = tts.getSampleRate();
+        ttsReady = true;
+
+        broadcastDebug("[tts-ok] SherpaOnnx TTS \u5c31\u7eea (sampleRate=" + ttsSampleRate + ")");
+    }
+
+    private void downloadModel(String urlStr, File destFile) throws IOException {
+        broadcastDebug("[tts] \u4e0b\u8f7d\u4e2d: " + urlStr);
+        
+        URL url = new URL(urlStr);
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+        conn.setConnectTimeout(30000);
+        conn.setReadTimeout(60000);
+        conn.setRequestProperty("User-Agent", "VoiceClock/1.0");
+        
+        int totalSize = conn.getContentLength();
+        broadcastDebug("[tts] \u6587\u4ef6\u5927\u5c0f: " + (totalSize / 1024 / 1024) + "MB");
+        
+        InputStream in = conn.getInputStream();
+        FileOutputStream out = new FileOutputStream(destFile);
+        
+        byte[] buffer = new byte[65536];
+        int bytesRead;
+        long totalRead = 0;
+        int lastPercent = 0;
+        
+        while ((bytesRead = in.read(buffer)) != -1) {
+            out.write(buffer, 0, bytesRead);
+            totalRead += bytesRead;
+            
+            if (totalSize > 0) {
+                int percent = (int) (totalRead * 100 / totalSize);
+                if (percent >= lastPercent + 10) {
+                    broadcastDebug("[tts] \u4e0b\u8f7d\u8fdb\u5ea6: " + percent + "%");
+                    lastPercent = percent;
+                }
+            }
+        }
+        
+        in.close();
+        out.close();
+        conn.disconnect();
+        
+        broadcastDebug("[tts] \u4e0b\u8f7d\u5b8c\u6210");
+    }
+
+    private void extractTarBz2(File tarBz2File, File destDir) throws IOException {
+        InputStream fi = new java.io.FileInputStream(tarBz2File);
+        BZip2CompressorInputStream bzIn = new BZip2CompressorInputStream(fi);
+        TarArchiveInputStream tarIn = new TarArchiveInputStream(bzIn);
+        
+        TarArchiveEntry entry;
+        int fileCount = 0;
+        
+        while ((entry = tarIn.getNextTarEntry()) != null) {
+            if (entry.isDirectory()) {
+                continue;
+            }
+            
+            // Strip the first directory component (e.g., "vits-zh-hf-theresa/")
+            String entryName = entry.getName();
+            int slashIndex = entryName.indexOf('/');
+            if (slashIndex >= 0) {
+                entryName = entryName.substring(slashIndex + 1);
+            }
+            
+            if (entryName.isEmpty()) continue;
+            
+            File outputFile = new File(destDir, entryName);
+            outputFile.getParentFile().mkdirs();
+            
+            FileOutputStream out = new FileOutputStream(outputFile);
+            byte[] buffer = new byte[8192];
+            int len;
+            while ((len = tarIn.read(buffer)) != -1) {
+                out.write(buffer, 0, len);
+            }
+            out.close();
+            fileCount++;
+        }
+        
+        tarIn.close();
+        bzIn.close();
+        fi.close();
+        
+        broadcastDebug("[tts] \u89e3\u538b\u5b8c\u6210: " + fileCount + " \u4e2a\u6587\u4ef6");
+    }
+
+    private String findFile(File dir, String suffix) {
+        if (!dir.exists() || !dir.isDirectory()) return null;
+        File[] files = dir.listFiles();
+        if (files == null) return null;
+
+        // First check direct children
+        for (File f : files) {
+            if (f.getName().equals(suffix) || f.getName().endsWith(suffix)) {
+                return f.getAbsolutePath();
+            }
+        }
+
+        // Then check subdirectories
+        for (File f : files) {
+            if (f.isDirectory()) {
+                String result = findFile(f, suffix);
+                if (result != null) return result;
+            }
+        }
+        return null;
+    }
+
+    // ========== Audio Playback ==========
+
+    private void playAudio(float[] samples, int sampleRate) {
+        if (samples == null || samples.length == 0) return;
+
+        // Convert float samples to short (PCM16)
+        short[] shortSamples = new short[samples.length];
+        for (int i = 0; i < samples.length; i++) {
+            float s = Math.max(-1.0f, Math.min(1.0f, samples[i]));
+            shortSamples[i] = (short) (s * Short.MAX_VALUE);
+        }
+
+        // Convert to byte buffer (little-endian)
+        byte[] audioBytes = new byte[shortSamples.length * 2];
+        ByteBuffer.wrap(audioBytes).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().put(shortSamples);
+
+        int bufferSize = AudioTrack.getMinBufferSize(
+                sampleRate,
+                AudioFormat.CHANNEL_OUT_MONO,
+                AudioFormat.ENCODING_PCM_16BIT
+        );
+
+        AudioAttributes attrs = new AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_MEDIA)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                .build();
+
+        AudioFormat format = new AudioFormat.Builder()
+                .setSampleRate(sampleRate)
+                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                .build();
+
+        AudioTrack audioTrack = new AudioTrack(
+                attrs,
+                format,
+                Math.max(bufferSize, audioBytes.length),
+                AudioTrack.MODE_STREAM,
+                AudioManager.AUDIO_SESSION_ID_GENERATE
+        );
+
+        requestAudioFocus();
+        audioTrack.play();
+        audioTrack.write(audioBytes, 0, audioBytes.length);
+
+        // Wait for playback to complete
+        try {
+            Thread.sleep((long) (samples.length * 1000.0 / sampleRate) + 100);
+        } catch (InterruptedException e) {
+            // ignore
+        }
+
+        audioTrack.stop();
+        audioTrack.release();
+        abandonAudioFocus();
+    }
+
+    // ========== Audio Focus ==========
+
+    private boolean requestAudioFocus() {
+        if (audioManager == null) return false;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            AudioAttributes attrs = new AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build();
+            audioFocusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
+                    .setAudioAttributes(attrs)
+                    .build();
+            return audioManager.requestAudioFocus(audioFocusRequest) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED;
+        } else {
+            @SuppressWarnings("deprecation")
+            int result = audioManager.requestAudioFocus(null, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN_TRANSIENT);
+            return result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED;
+        }
+    }
+
+    private void abandonAudioFocus() {
+        if (audioManager == null) return;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            if (audioFocusRequest != null) {
+                audioManager.abandonAudioFocusRequest(audioFocusRequest);
+            }
+        } else {
+            audioManager.abandonAudioFocus(null);
+        }
+    }
+
+    // ========== Speech Recognition Loop ==========
+
+    private boolean initAudioRecord() {
+        int minBufferSize = AudioRecord.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT);
+        if (minBufferSize == AudioRecord.ERROR || minBufferSize == AudioRecord.ERROR_BAD_VALUE) return false;
+
+        int bufferSize = Math.max(minBufferSize, 16000);
+        try {
+            audioRecord = new AudioRecord(MediaRecorder.AudioSource.VOICE_RECOGNITION, SAMPLE_RATE,
+                    AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, bufferSize);
+        } catch (SecurityException e) {
+            lastError = "Permission denied";
+            return false;
+        } catch (Exception e) {
+            lastError = e.getMessage();
+            return false;
+        }
+
+        if (audioRecord.getState() != AudioRecord.STATE_INITIALIZED) {
+            audioRecord.release();
+            audioRecord = null;
+            return false;
+        }
+        return true;
+    }
+
+    private void startRecognitionLoop() {
+        isListening = true;
+        broadcastStatus(STATUS_LISTENING);
+
+        recognitionThread = new Thread(() -> {
+            audioRecord.startRecording();
+            byte[] buffer = new byte[8192];
+
+            while (isListening) {
+                int bytesRead = audioRecord.read(buffer, 0, buffer.length);
+                if (bytesRead < 0) break;
+
+                if (bytesRead > 0 && recognizer != null && modelReady) {
+                    try {
+                        if (recognizer.acceptWaveForm(buffer, bytesRead)) {
+                            processResult(recognizer.getResult());
+                        } else {
+                            processPartialResult(recognizer.getPartialResult());
+                        }
+                    } catch (Exception e) {
+                        Log.e(TAG, "Recognition error", e);
+                    }
+                }
+            }
+        });
+        recognitionThread.start();
+    }
+
+    private void processResult(String resultJson) {
+        try {
+            String text = new JSONObject(resultJson).optString("text", "");
+            broadcastDebug("[\u8bc6\u522b] " + text);
+            if (containsTimeQuery(text)) {
+                broadcastDebug("[\u547d\u4e2d] \u68c0\u6d4b\u5230\u65f6\u95f4\u8be2\u95ee\uff01");
+                handler.post(this::speakTime);
+            }
+        } catch (Exception e) {
+            broadcastDebug("[error] \u89e3\u6790\u7ed3\u679c\u5931\u8d25");
+        }
+    }
+
+    private void processPartialResult(String partialJson) {
+        try {
+            String text = new JSONObject(partialJson).optString("partial", "");
+            if (!text.isEmpty()) {
+                broadcastDebug("[\u8bed\u97f3] " + text);
+            }
+            if (containsTimeQuery(text)) {
+                broadcastDebug("[\u547d\u4e2d] \u68c0\u6d4b\u5230\u65f6\u95ee\uff01");
+                handler.post(this::speakTime);
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Partial result error", e);
+        }
+    }
+
+    private boolean containsTimeQuery(String text) {
+        if (text == null || text.isEmpty()) return false;
+        return text.contains("\u51e0\u70b9\u4e86") || text.contains("\u51e0\u70b9\u5566")
+                || text.contains("\u4ec0\u4e48\u65f6\u95f4") || text.contains("\u73b0\u5728\u65f6\u95f4")
+                || text.contains("\u51e0\u65f6") || text.contains("\u51e0\u70b9");
+    }
+
+    // ========== Speak Time (using SherpaOnnx TTS) ==========
+
+    private void speakTime() {
+        if (!ttsReady || tts == null) {
+            broadcastDebug("[tts-error] TTS \u672a\u5c31\u7eea");
+            return;
+        }
+
+        Calendar calendar = Calendar.getInstance();
+        int hour = calendar.get(Calendar.HOUR_OF_DAY);
+        int minute = calendar.get(Calendar.MINUTE);
+
+        String period;
+        if (hour < 6) period = "\u51cc\u6668";
+        else if (hour < 12) period = "\u4e0a\u5348";
+        else if (hour < 14) period = "\u4e2d\u5348";
+        else if (hour < 18) period = "\u4e0b\u5348";
+        else period = "\u665a\u4e0a";
+
+        int displayHour = hour % 12;
+        if (displayHour == 0) displayHour = 12;
+
+        String timeText = "\u73b0\u5728\u662f" + period + displayHour + "\u70b9" + minute + "\u5206";
+        broadcastDebug("[tts] \u64ad\u62a5: " + timeText);
+
+        new Thread(() -> {
+            try {
+                GeneratedAudio audio = tts.generate(timeText);
+                if (audio != null && audio.getSamples() != null && audio.getSamples().length > 0) {
+                    broadcastDebug("[tts-ok] \u751f\u6210\u97f3\u9891 " + audio.getSamples().length + " \u91c7\u6837\u70b9");
+                    playAudio(audio.getSamples(), audio.getSampleRate());
+                    broadcastDebug("[tts-ok] \u64ad\u62a5\u5b8c\u6210");
+                } else {
+                    broadcastDebug("[tts-error] \u751f\u6210\u97f3\u9891\u5931\u8d25");
+                }
+            } catch (Exception e) {
+                broadcastDebug("[tts-error] " + e.getMessage());
+                Log.e(TAG, "TTS error", e);
+            }
+        }).start();
+    }
+
+    // ========== File Operations ==========
+
     private void deleteRecursive(File file) {
         if (file.isDirectory()) {
             File[] children = file.listFiles();
             if (children != null) {
-                for (File child : children) {
-                    deleteRecursive(child);
-                }
+                for (File child : children) deleteRecursive(child);
             }
         }
         file.delete();
     }
 
     private void copyAssetFolder(String assetFolder, String destPath) throws IOException {
-        File destDir = new File(destPath);
-        destDir.mkdirs();
-
+        new File(destPath).mkdirs();
         String[] files = getAssets().list(assetFolder);
         if (files == null) return;
 
         for (String fileName : files) {
             String assetPath = assetFolder + "/" + fileName;
             String destFilePath = destPath + "/" + fileName;
-
             String[] subFiles = getAssets().list(assetPath);
             if (subFiles != null && subFiles.length > 0) {
                 copyAssetFolder(assetPath, destFilePath);
@@ -209,175 +587,46 @@ public class VoiceService extends Service {
         out.close();
     }
 
-    private boolean initAudioRecord() {
-        int minBufferSize = AudioRecord.getMinBufferSize(
-                SAMPLE_RATE,
-                AudioFormat.CHANNEL_IN_MONO,
-                AudioFormat.ENCODING_PCM_16BIT
-        );
+    // ========== Broadcast & Notification ==========
 
-        Log.d(TAG, "AudioRecord min buffer size: " + minBufferSize);
-
-        if (minBufferSize == AudioRecord.ERROR || minBufferSize == AudioRecord.ERROR_BAD_VALUE) {
-            Log.e(TAG, "Invalid min buffer size: " + minBufferSize);
-            return false;
-        }
-
-        int bufferSize = Math.max(minBufferSize, 16000);
-
-        try {
-            audioRecord = new AudioRecord(
-                    MediaRecorder.AudioSource.VOICE_RECOGNITION,
-                    SAMPLE_RATE,
-                    AudioFormat.CHANNEL_IN_MONO,
-                    AudioFormat.ENCODING_PCM_16BIT,
-                    bufferSize
-            );
-        } catch (SecurityException e) {
-            Log.e(TAG, "No RECORD_AUDIO permission!", e);
-            lastError = "Permission denied";
-            return false;
-        } catch (Exception e) {
-            Log.e(TAG, "AudioRecord constructor failed", e);
-            lastError = e.getMessage();
-            return false;
-        }
-
-        if (audioRecord.getState() != AudioRecord.STATE_INITIALIZED) {
-            Log.e(TAG, "AudioRecord not initialized, state: " + audioRecord.getState());
-            audioRecord.release();
-            audioRecord = null;
-            return false;
-        }
-
-        Log.d(TAG, "AudioRecord initialized successfully, buffer: " + bufferSize);
-        return true;
+    private void broadcastStatus(String status) {
+        Intent intent = new Intent(ACTION_STATUS);
+        intent.putExtra(EXTRA_STATUS, status);
+        intent.putExtra("error", lastError);
+        LocalBroadcastManager.getInstance(this).sendBroadcast(intent);
+        updateNotification(status);
     }
 
-    private void startRecognitionLoop() {
-        isListening = true;
-        broadcastStatus(STATUS_LISTENING);
-
-        recognitionThread = new Thread(() -> {
-            audioRecord.startRecording();
-            Log.d(TAG, "AudioRecord started recording");
-
-            byte[] buffer = new byte[8192];
-            int loopCount = 0;
-
-            while (isListening) {
-                int bytesRead = audioRecord.read(buffer, 0, buffer.length);
-
-                if (bytesRead < 0) {
-                    Log.e(TAG, "AudioRecord read error: " + bytesRead);
-                    break;
-                }
-
-                if (bytesRead > 0 && recognizer != null && modelReady) {
-                    try {
-                        if (recognizer.acceptWaveForm(buffer, bytesRead)) {
-                            String result = recognizer.getResult();
-                            processResult(result);
-                        } else {
-                            String partial = recognizer.getPartialResult();
-                            processPartialResult(partial);
-                        }
-                    } catch (Exception e) {
-                        Log.e(TAG, "Recognition error", e);
-                    }
-                }
-
-                loopCount++;
-                if (loopCount % 50 == 0) {
-                    Log.d(TAG, "Recognition loop alive, processed " + loopCount + " buffers");
-                }
-            }
-
-            Log.d(TAG, "Recognition loop exited");
-        });
-        recognitionThread.start();
-    }
-
-    private void processResult(String resultJson) {
-        try {
-            JSONObject json = new JSONObject(resultJson);
-            String text = json.optString("text", "");
-            Log.d(TAG, "Final result: [" + text + "]");
-            broadcastDebug("[\u8bc6\u522b] " + text);
-
-            if (containsTimeQuery(text)) {
-                broadcastDebug("[\u547d\u4e2d] \u68c0\u6d4b\u5230\u65f6\u95f4\u8be2\u95ee\uff01");
-                handler.post(() -> speakTime());
-            }
-        } catch (Exception e) {
-            Log.e(TAG, "Error parsing result", e);
-            broadcastDebug("[error] \u89e3\u6790\u7ed3\u679c\u5931\u8d25");
-        }
-    }
-
-    private void processPartialResult(String partialJson) {
-        try {
-            JSONObject json = new JSONObject(partialJson);
-            String text = json.optString("partial", "");
-
-            if (!text.isEmpty()) {
-                Log.d(TAG, "Partial: [" + text + "]");
-                broadcastDebug("[\u8bed\u97f3] " + text);
-            }
-
-            if (containsTimeQuery(text)) {
-                broadcastDebug("[\u547d\u4e2d] \u68c0\u6d4b\u5230\u65f6\u95f4\u8be2\u95ee\uff01");
-                handler.post(() -> speakTime());
-            }
-        } catch (Exception e) {
-            Log.e(TAG, "Error parsing partial result", e);
-        }
-    }
-
-    private boolean containsTimeQuery(String text) {
-        if (text == null || text.isEmpty()) return false;
-        return text.contains("\u51e0\u70b9\u4e86")
-                || text.contains("\u51e0\u70b9\u5566")
-                || text.contains("\u4ec0\u4e48\u65f6\u95f4")
-                || text.contains("\u73b0\u5728\u65f6\u95f4")
-                || text.contains("\u51e0\u65f6")
-                || text.contains("\u51e0\u70b9");
+    private void broadcastDebug(String message) {
+        Intent intent = new Intent(ACTION_DEBUG);
+        intent.putExtra(EXTRA_DEBUG, message);
+        LocalBroadcastManager.getInstance(this).sendBroadcast(intent);
+        Log.d(TAG, message);
     }
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        Notification notification = buildNotification("\u52a0\u8f7d\u4e2d...");
-        startForeground(NOTIFICATION_ID, notification);
+        startForeground(NOTIFICATION_ID, buildNotification("\u52a0\u8f7d\u4e2d..."));
         return START_STICKY;
     }
 
     private void updateNotification(String status) {
         String text;
         switch (status) {
-            case STATUS_LOADING:
-                text = "\u6b63\u5728\u52a0\u8f7d\u79bb\u7ebf\u6a21\u578b...";
-                break;
+            case STATUS_LOADING: text = "\u6b63\u5728\u52a0\u8f7d\u79bb\u7ebf\u6a21\u578b..."; break;
             case STATUS_READY:
-            case STATUS_LISTENING:
-                text = "\u79bb\u7ebf\u76d1\u542c\u4e2d... \u8bf4\u201c\u51e0\u70b9\u4e86\u201d\u83b7\u53d6\u65f6\u95f4";
-                break;
-            case STATUS_ERROR:
-                text = "\u9519\u8bef: " + lastError;
-                break;
-            default:
-                text = "\u8fd0\u884c\u4e2d";
+            case STATUS_LISTENING: text = "\u79bb\u7ebf\u76d1\u542c\u4e2d... \u8bf4\"\u51e0\u70b9\u4e86\"\u83b7\u53d6\u65f6\u95f4"; break;
+            case STATUS_ERROR: text = "\u9519\u8bef: " + lastError; break;
+            default: text = "\u8fd0\u884c\u4e2d";
         }
-
-        Notification notification = new NotificationCompat.Builder(this, CHANNEL_ID)
-                .setContentTitle("\u8bed\u97f3\u52a9\u624b")
-                .setContentText(text)
-                .setSmallIcon(R.drawable.ic_notification)
-                .setOngoing(true)
-                .build();
-
         NotificationManager manager = getSystemService(NotificationManager.class);
         if (manager != null) {
-            manager.notify(NOTIFICATION_ID, notification);
+            manager.notify(NOTIFICATION_ID, new NotificationCompat.Builder(this, CHANNEL_ID)
+                    .setContentTitle("\u8bed\u97f3\u52a9\u624b")
+                    .setContentText(text)
+                    .setSmallIcon(R.drawable.ic_notification)
+                    .setOngoing(true)
+                    .build());
         }
     }
 
@@ -390,317 +639,41 @@ public class VoiceService extends Service {
                 .build();
     }
 
+    private void createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            NotificationChannel channel = new NotificationChannel(
+                    CHANNEL_ID, "\u8bed\u97f3\u52a9\u624b", NotificationManager.IMPORTANCE_LOW);
+            NotificationManager manager = getSystemService(NotificationManager.class);
+            if (manager != null) manager.createNotificationChannel(channel);
+        }
+    }
+
+    // ========== Lifecycle ==========
+
     @Override
     public void onDestroy() {
         super.onDestroy();
         isRunning = false;
         isListening = false;
         modelReady = false;
+        ttsReady = false;
 
         if (audioRecord != null) {
-            try {
-                audioRecord.stop();
-            } catch (Exception e) {
-                // ignore
-            }
+            try { audioRecord.stop(); } catch (Exception e) { /* ignore */ }
             audioRecord.release();
             audioRecord = null;
         }
-
         if (recognitionThread != null) {
             recognitionThread.interrupt();
             recognitionThread = null;
         }
-
-        if (recognizer != null) {
-            recognizer.close();
-            recognizer = null;
-        }
-
-        if (voskModel != null) {
-            voskModel.close();
-            voskModel = null;
-        }
-
-        if (textToSpeech != null) {
-            textToSpeech.shutdown();
-            textToSpeech = null;
-        }
-
+        if (recognizer != null) { recognizer.close(); recognizer = null; }
+        if (voskModel != null) { voskModel.close(); voskModel = null; }
+        if (tts != null) { tts.release(); tts = null; }
         abandonAudioFocus();
         handler.removeCallbacksAndMessages(null);
     }
 
     @Override
-    public IBinder onBind(Intent intent) {
-        return null;
-    }
-
-    private void createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            NotificationChannel channel = new NotificationChannel(
-                    CHANNEL_ID,
-                    "\u8bed\u97f3\u52a9\u624b",
-                    NotificationManager.IMPORTANCE_LOW
-            );
-            channel.setDescription("\u8bed\u97f3\u65f6\u949f\u52a9\u624b\u901a\u77e5");
-            NotificationManager manager = getSystemService(NotificationManager.class);
-            if (manager != null) {
-                manager.createNotificationChannel(channel);
-            }
-        }
-    }
-
-    // ========== TTS Management ==========
-
-    private java.util.List<EngineInfo> availableEngines;
-    private int currentEngineIndex = 0;
-
-    private void initTTS() {
-        broadcastDebug("[tts] \u626b\u63cf\u53ef\u7528\u7684\u8bed\u97f3\u5f15\u64ce...");
-
-        // Create a temporary TTS instance just to query available engines
-        TextToSpeech tempTts = new TextToSpeech(this, null);
-        availableEngines = tempTts.getEngines();
-        tempTts.shutdown();
-
-        broadcastDebug("[tts] \u53d1\u73b0 " + availableEngines.size() + " \u4e2a\u5f15\u64ce:");
-
-        for (int i = 0; i < availableEngines.size(); i++) {
-            EngineInfo info = availableEngines.get(i);
-            broadcastDebug("[tts]   " + (i + 1) + ". " + info.label + " (" + info.name + ")");
-            Log.d(TAG, "Found TTS engine: " + info.label + " (" + info.name + ")");
-        }
-
-        if (availableEngines.isEmpty()) {
-            broadcastDebug("[tts-error] \u672a\u627e\u5230\u4efb\u4f55TTS\u5f15\u64ce\uff01");
-            ttsReady = false;
-            return;
-        }
-
-        // Try each engine one by one
-        currentEngineIndex = 0;
-        tryNextEngine();
-    }
-
-    private void tryNextEngine() {
-        if (currentEngineIndex >= availableEngines.size()) {
-            broadcastDebug("[tts-error] \u6240\u6709\u5f15\u64ce\u90fd\u4e0d\u652f\u6301\u4e2d\u6587\uff0c\u5c1d\u8bd5\u82f1\u6587\u56de\u9000...");
-            initEnglishFallback();
-            return;
-        }
-
-        EngineInfo engineInfo = availableEngines.get(currentEngineIndex);
-        broadcastDebug("[tts] \u5c1d\u8bd5\u5f15\u64ce: " + engineInfo.label);
-
-        if (textToSpeech != null) {
-            textToSpeech.shutdown();
-        }
-
-        final String engineName = engineInfo.name;
-        textToSpeech = new TextToSpeech(this, new OnInitListener() {
-            @Override
-            public void onInit(int status) {
-                if (status == TextToSpeech.SUCCESS) {
-                    if (trySetChinese(textToSpeech)) {
-                        ttsReady = true;
-                        broadcastDebug("[tts-ok] \u4f7f\u7528\u5f15\u64ce: " + engineName);
-                        setupTTSListeners();
-                    } else {
-                        broadcastDebug("[tts-warn] " + engineName + " \u4e0d\u652f\u6301\u4e2d\u6587");
-                        currentEngineIndex++;
-                        handler.postDelayed(() -> tryNextEngine(), 100);
-                    }
-                } else {
-                    broadcastDebug("[tts-error] " + engineName + " \u521d\u59cb\u5316\u5931\u8d25");
-                    currentEngineIndex++;
-                    handler.postDelayed(() -> tryNextEngine(), 100);
-                }
-            }
-        }, engineName);
-    }
-
-    private boolean trySetChinese(TextToSpeech tts) {
-        // Try different Chinese locales
-        Locale[] chineseLocales = {
-            Locale.CHINESE,
-            Locale.SIMPLIFIED_CHINESE,
-            Locale.TRADITIONAL_CHINESE,
-            new Locale("zh", "CN"),
-            new Locale("zh", "TW"),
-            new Locale("zh")
-        };
-
-        for (Locale locale : chineseLocales) {
-            int result = tts.setLanguage(locale);
-            if (result != TextToSpeech.LANG_MISSING_DATA && result != TextToSpeech.LANG_NOT_SUPPORTED) {
-                broadcastDebug("[tts] \u8bed\u8a00\u8bbe\u7f6e\u6210\u529f: " + locale.getDisplayName());
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private void initEnglishFallback() {
-        broadcastDebug("[tts] \u5c1d\u8bd5\u82f1\u6587TTS\u4f5c\u4e3a\u56de\u9000...");
-
-        if (textToSpeech != null) {
-            textToSpeech.shutdown();
-        }
-
-        // Try default engine with English
-        textToSpeech = new TextToSpeech(this, new OnInitListener() {
-            @Override
-            public void onInit(int status) {
-                if (status == TextToSpeech.SUCCESS) {
-                    int result = textToSpeech.setLanguage(Locale.ENGLISH);
-                    if (result != TextToSpeech.LANG_MISSING_DATA && result != TextToSpeech.LANG_NOT_SUPPORTED) {
-                        ttsReady = true;
-                        broadcastDebug("[tts-ok] \u82f1\u6587TTS\u56de\u9000\u6210\u529f");
-                        setupTTSListeners();
-                    } else {
-                        broadcastDebug("[tts-error] \u82f1\u6587TTS\u4e5f\u4e0d\u53ef\u7528");
-                        ttsReady = false;
-                    }
-                } else {
-                    broadcastDebug("[tts-error] \u9ed8\u8ba4\u5f15\u64ce\u521d\u59cb\u5316\u5931\u8d25");
-                    ttsReady = false;
-                }
-            }
-        });
-    }
-
-    private void setupTTSListeners() {
-        if (textToSpeech == null) return;
-
-        textToSpeech.setOnUtteranceProgressListener(new UtteranceProgressListener() {
-            @Override
-            public void onStart(String utteranceId) {
-                Log.d(TAG, "TTS started: " + utteranceId);
-            }
-
-            @Override
-            public void onDone(String utteranceId) {
-                Log.d(TAG, "TTS done: " + utteranceId);
-                abandonAudioFocus();
-            }
-
-            @Override
-            public void onError(String utteranceId) {
-                Log.e(TAG, "TTS error: " + utteranceId);
-                broadcastDebug("[tts-error] \u64ad\u62a5\u5931\u8d25: " + utteranceId);
-                abandonAudioFocus();
-            }
-        });
-    }
-
-    private boolean requestAudioFocus() {
-        if (audioManager == null) return false;
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            AudioAttributes attrs = new AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_MEDIA)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                    .build();
-
-            audioFocusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
-                    .setAudioAttributes(attrs)
-                    .setOnAudioFocusChangeListener(new AudioManager.OnAudioFocusChangeListener() {
-                        @Override
-                        public void onAudioFocusChange(int focusChange) {
-                            Log.d(TAG, "Audio focus changed: " + focusChange);
-                        }
-                    })
-                    .build();
-
-            int result = audioManager.requestAudioFocus(audioFocusRequest);
-            return result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED;
-        } else {
-            @SuppressWarnings("deprecation")
-            int result = audioManager.requestAudioFocus(
-                    new AudioManager.OnAudioFocusChangeListener() {
-                        @Override
-                        public void onAudioFocusChange(int focusChange) {
-                            Log.d(TAG, "Audio focus changed: " + focusChange);
-                        }
-                    },
-                    AudioManager.STREAM_MUSIC,
-                    AudioManager.AUDIOFOCUS_GAIN_TRANSIENT
-            );
-            return result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED;
-        }
-    }
-
-    private void abandonAudioFocus() {
-        if (audioManager == null) return;
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            if (audioFocusRequest != null) {
-                audioManager.abandonAudioFocusRequest(audioFocusRequest);
-            }
-        } else {
-            @SuppressWarnings("deprecation")
-            AudioManager.OnAudioFocusChangeListener listener = null;
-            audioManager.abandonAudioFocus(listener);
-        }
-    }
-
-    private void speakTime() {
-        if (!ttsReady) {
-            broadcastDebug("[tts-error] TTS \u672a\u5c31\u7eea\uff0c\u65e0\u6cd5\u64ad\u62a5");
-            return;
-        }
-
-        if (!requestAudioFocus()) {
-            broadcastDebug("[tts-warn] \u97f3\u9891\u805a\u7126\u83b7\u53d6\u5931\u8d25");
-        }
-
-        Calendar calendar = Calendar.getInstance();
-        int hour = calendar.get(Calendar.HOUR_OF_DAY);
-        int minute = calendar.get(Calendar.MINUTE);
-
-        String period;
-        if (hour < 6) {
-            period = "\u51cc\u6668";
-        } else if (hour < 12) {
-            period = "\u4e0a\u5348";
-        } else if (hour < 14) {
-            period = "\u4e2d\u5348";
-        } else if (hour < 18) {
-            period = "\u4e0b\u5348";
-        } else {
-            period = "\u665a\u4e0a";
-        }
-
-        int displayHour = hour % 12;
-        if (displayHour == 0) displayHour = 12;
-
-        Locale ttsLocale = textToSpeech.getLanguage();
-        String timeText;
-
-        // Use Chinese if available, otherwise use English with numbers
-        if (ttsLocale != null && (ttsLocale.getLanguage().equals("zh")
-                || ttsLocale.equals(Locale.CHINESE)
-                || ttsLocale.equals(Locale.SIMPLIFIED_CHINESE)
-                || ttsLocale.equals(Locale.TRADITIONAL_CHINESE))) {
-            timeText = "\u73b0\u5728\u662f" + period + displayHour
-                    + "\u70b9" + minute + "\u5206";
-        } else {
-            // English fallback: "Now is 3:25"
-            timeText = "Now is " + displayHour + ":" + String.format("%02d", minute);
-        }
-
-        broadcastDebug("[tts] \u64ad\u62a5: " + timeText);
-        Log.d(TAG, "Speaking: " + timeText);
-
-        int speakResult = textToSpeech.speak(timeText, TextToSpeech.QUEUE_FLUSH, null, "time_announcement");
-
-        if (speakResult == TextToSpeech.SUCCESS) {
-            broadcastDebug("[tts-ok] \u64ad\u62a5\u6307\u4ee4\u5df2\u53d1\u9001");
-        } else if (speakResult == TextToSpeech.ERROR) {
-            broadcastDebug("[tts-error] speak() \u8fd4\u56de ERROR");
-        } else {
-            broadcastDebug("[tts-warn] speak() \u8fd4\u56de: " + speakResult);
-        }
-    }
+    public IBinder onBind(Intent intent) { return null; }
 }
