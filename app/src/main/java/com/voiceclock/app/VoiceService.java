@@ -13,6 +13,7 @@ import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
 import android.speech.tts.TextToSpeech;
+import android.speech.tts.TextToSpeech.EngineInfo;
 import android.speech.tts.TextToSpeech.OnInitListener;
 import android.speech.tts.UtteranceProgressListener;
 import android.util.Log;
@@ -137,17 +138,16 @@ public class VoiceService extends Service {
 
                 broadcastDebug("[ok] \u97f3\u9891\u5f55\u5236\u521d\u59cb\u5316\u6210\u529f");
 
-                // Wait for TTS to be ready (up to 5 seconds)
+                // Wait for TTS to be ready (up to 15 seconds, trying multiple engines)
                 broadcastDebug("[tts] \u7b49\u5f85\u8bed\u97f3\u5408\u6210\u5f15\u64ce\u5c31\u7eea...");
                 int waitCount = 0;
-                while (!ttsReady && waitCount < 50) {
+                while (!ttsReady && waitCount < 150) {
                     Thread.sleep(100);
                     waitCount++;
                 }
 
                 if (!ttsReady) {
-                    broadcastDebug("[tts-warn] TTS \u5f15\u64ce\u672a\u5c31\u7eea\uff0c\u5c1d\u8bd5\u56de\u9000\u65b9\u6848...");
-                    initTTSFallback();
+                    broadcastDebug("[tts-warn] TTS \u5f15\u64ce\u672a\u5c31\u7eea\uff0c\u5c06\u5728\u540e\u53f0\u7ee7\u7eed\u5c1d\u8bd5...");
                 }
 
                 modelReady = true;
@@ -453,86 +453,121 @@ public class VoiceService extends Service {
 
     // ========== TTS Management ==========
 
-    private void initTTS() {
-        broadcastDebug("[tts] \u521d\u59cb\u5316\u8bed\u97f3\u5408\u6210\u5f15\u64ce...");
+    private java.util.List<EngineInfo> availableEngines;
+    private int currentEngineIndex = 0;
 
-        textToSpeech = new TextToSpeech(this, new OnInitListener() {
-            @Override
-            public void onInit(int status) {
-                if (status == TextToSpeech.SUCCESS) {
-                    configureTTS(textToSpeech, "default");
-                } else {
-                    broadcastDebug("[tts-error] \u5f15\u64ce\u521d\u59cb\u5316\u5931\u8d25, status=" + status);
-                    Log.e(TAG, "TTS init failed with status: " + status);
-                }
-            }
-        });
+    private void initTTS() {
+        broadcastDebug("[tts] \u626b\u63cf\u53ef\u7528\u7684\u8bed\u97f3\u5f15\u64ce...");
+
+        // Create a temporary TTS instance just to query available engines
+        TextToSpeech tempTts = new TextToSpeech(this, null);
+        availableEngines = tempTts.getEngines();
+        tempTts.shutdown();
+
+        broadcastDebug("[tts] \u53d1\u73b0 " + availableEngines.size() + " \u4e2a\u5f15\u64ce:");
+
+        for (int i = 0; i < availableEngines.size(); i++) {
+            EngineInfo info = availableEngines.get(i);
+            broadcastDebug("[tts]   " + (i + 1) + ". " + info.label + " (" + info.name + ")");
+            Log.d(TAG, "Found TTS engine: " + info.label + " (" + info.name + ")");
+        }
+
+        if (availableEngines.isEmpty()) {
+            broadcastDebug("[tts-error] \u672a\u627e\u5230\u4efb\u4f55TTS\u5f15\u64ce\uff01");
+            ttsReady = false;
+            return;
+        }
+
+        // Try each engine one by one
+        currentEngineIndex = 0;
+        tryNextEngine();
     }
 
-    private void initTTSFallback() {
-        broadcastDebug("[tts] \u5c1d\u8bd5\u56de\u9000\u65b9\u6848: \u4f7f\u7528\u82f1\u6587 TTS + \u6570\u5b57\u62a5\u65f6...");
+    private void tryNextEngine() {
+        if (currentEngineIndex >= availableEngines.size()) {
+            broadcastDebug("[tts-error] \u6240\u6709\u5f15\u64ce\u90fd\u4e0d\u652f\u6301\u4e2d\u6587\uff0c\u5c1d\u8bd5\u82f1\u6587\u56de\u9000...");
+            initEnglishFallback();
+            return;
+        }
+
+        EngineInfo engineInfo = availableEngines.get(currentEngineIndex);
+        broadcastDebug("[tts] \u5c1d\u8bd5\u5f15\u64ce: " + engineInfo.label);
 
         if (textToSpeech != null) {
             textToSpeech.shutdown();
         }
 
-        // Try with English as fallback - numbers are universal
+        final String engineName = engineInfo.name;
+        textToSpeech = new TextToSpeech(this, new OnInitListener() {
+            @Override
+            public void onInit(int status) {
+                if (status == TextToSpeech.SUCCESS) {
+                    if (trySetChinese(textToSpeech)) {
+                        ttsReady = true;
+                        broadcastDebug("[tts-ok] \u4f7f\u7528\u5f15\u64ce: " + engineName);
+                        setupTTSListeners();
+                    } else {
+                        broadcastDebug("[tts-warn] " + engineName + " \u4e0d\u652f\u6301\u4e2d\u6587");
+                        currentEngineIndex++;
+                        handler.postDelayed(() -> tryNextEngine(), 100);
+                    }
+                } else {
+                    broadcastDebug("[tts-error] " + engineName + " \u521d\u59cb\u5316\u5931\u8d25");
+                    currentEngineIndex++;
+                    handler.postDelayed(() -> tryNextEngine(), 100);
+                }
+            }
+        }, engineName);
+    }
+
+    private boolean trySetChinese(TextToSpeech tts) {
+        // Try different Chinese locales
+        Locale[] chineseLocales = {
+            Locale.CHINESE,
+            Locale.SIMPLIFIED_CHINESE,
+            Locale.TRADITIONAL_CHINESE,
+            new Locale("zh", "CN"),
+            new Locale("zh", "TW"),
+            new Locale("zh")
+        };
+
+        for (Locale locale : chineseLocales) {
+            int result = tts.setLanguage(locale);
+            if (result != TextToSpeech.LANG_MISSING_DATA && result != TextToSpeech.LANG_NOT_SUPPORTED) {
+                broadcastDebug("[tts] \u8bed\u8a00\u8bbe\u7f6e\u6210\u529f: " + locale.getDisplayName());
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void initEnglishFallback() {
+        broadcastDebug("[tts] \u5c1d\u8bd5\u82f1\u6587TTS\u4f5c\u4e3a\u56de\u9000...");
+
+        if (textToSpeech != null) {
+            textToSpeech.shutdown();
+        }
+
+        // Try default engine with English
         textToSpeech = new TextToSpeech(this, new OnInitListener() {
             @Override
             public void onInit(int status) {
                 if (status == TextToSpeech.SUCCESS) {
                     int result = textToSpeech.setLanguage(Locale.ENGLISH);
-                    if (result != TextToSpeech.LANG_MISSING_DATA
-                            && result != TextToSpeech.LANG_NOT_SUPPORTED) {
+                    if (result != TextToSpeech.LANG_MISSING_DATA && result != TextToSpeech.LANG_NOT_SUPPORTED) {
                         ttsReady = true;
-                        broadcastDebug("[tts-ok] \u82f1\u6587 TTS \u56de\u9000\u6210\u529f");
+                        broadcastDebug("[tts-ok] \u82f1\u6587TTS\u56de\u9000\u6210\u529f");
                         setupTTSListeners();
                     } else {
-                        broadcastDebug("[tts-error] \u82f1\u6587 TTS \u4e5f\u4e0d\u53ef\u7528");
+                        broadcastDebug("[tts-error] \u82f1\u6587TTS\u4e5f\u4e0d\u53ef\u7528");
+                        ttsReady = false;
                     }
                 } else {
-                    broadcastDebug("[tts-error] \u56de\u9000\u5f15\u64ce\u4e5f\u5931\u8d25");
+                    broadcastDebug("[tts-error] \u9ed8\u8ba4\u5f15\u64ce\u521d\u59cb\u5316\u5931\u8d25");
+                    ttsReady = false;
                 }
             }
         });
-    }
-
-    private void configureTTS(TextToSpeech tts, String engineName) {
-        broadcastDebug("[tts] \u914d\u7f6e " + engineName + " \u5f15\u64ce...");
-
-        // Try Chinese first
-        int result = tts.setLanguage(Locale.CHINESE);
-        broadcastDebug("[tts] setLanguage(CHINESE) = " + result);
-
-        if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
-            broadcastDebug("[tts-warn] \u4e2d\u6587\u8bed\u97f3\u6570\u636e\u7f3a\u5931\uff0c\u5c1d\u8bd5\u5176\u4ed6\u8bed\u8a00...");
-
-            // Try Simplified Chinese
-            result = tts.setLanguage(Locale.SIMPLIFIED_CHINESE);
-            broadcastDebug("[tts] setLanguage(SIMPLIFIED_CHINESE) = " + result);
-
-            if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
-                // Try Taiwan Chinese
-                result = tts.setLanguage(Locale.TRADITIONAL_CHINESE);
-                broadcastDebug("[tts] setLanguage(TRADITIONAL_CHINESE) = " + result);
-
-                if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
-                    // Last resort: try default locale
-                    result = tts.setLanguage(Locale.getDefault());
-                    broadcastDebug("[tts] setLanguage(default=" + Locale.getDefault().getDisplayName() + ") = " + result);
-
-                    if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
-                        broadcastDebug("[tts-error] \u65e0\u4efb\u4f55\u53ef\u7528\u8bed\u8a00\uff0cTTS \u4e0d\u53ef\u7528");
-                        ttsReady = false;
-                        return;
-                    }
-                }
-            }
-        }
-
-        ttsReady = true;
-        broadcastDebug("[tts-ok] \u8bed\u97f3\u5408\u6210\u5f15\u64ce\u5c31\u7eea (lang=" + tts.getLanguage().getDisplayName() + ")");
-        setupTTSListeners();
     }
 
     private void setupTTSListeners() {
