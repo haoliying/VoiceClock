@@ -94,6 +94,11 @@ public class MainActivity extends AppCompatActivity {
     private void updateFromService() {
         serviceRunning = VoiceService.isRunning;
         updateUI();
+        // Request a status update from the service if it's running
+        if (serviceRunning) {
+            Intent intent = new Intent(VoiceService.ACTION_REQUEST_STATUS);
+            LocalBroadcastManager.getInstance(this).sendBroadcast(intent);
+        }
     }
 
     private void requestPermissions() {
@@ -176,6 +181,12 @@ public class MainActivity extends AppCompatActivity {
     private void updateUI() {
         if (serviceRunning) {
             btnStartStop.setText("\u505c\u6b62\u670d\u52a1");
+            // Don't reset status text here - let the broadcast receiver handle it
+            // Only set a default if status is empty
+            if (tvStatus.getText().toString().isEmpty() || 
+                tvStatus.getText().toString().contains("\u5df2\u505c\u6b62")) {
+                tvStatus.setText("\u670d\u52a1\u72b6\u6001\uff1a\u52a0\u8f7d\u4e2d...");
+            }
         } else {
             btnStartStop.setText("\u542f\u52a8\u670d\u52a1");
             tvStatus.setText("\u670d\u52a1\u72b6\u6001\uff1a\u5df2\u505c\u6b62");

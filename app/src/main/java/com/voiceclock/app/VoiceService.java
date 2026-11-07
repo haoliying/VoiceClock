@@ -4,7 +4,6 @@ import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.Service;
-import android.content.Intent;
 import android.media.AudioAttributes;
 import android.media.AudioFocusRequest;
 import android.media.AudioFormat;
@@ -46,6 +45,11 @@ import org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream;
 import org.vosk.Model;
 import org.vosk.Recognizer;
 
+import android.content.BroadcastReceiver;
+import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
+
 public class VoiceService extends Service {
 
     private static final String TAG = "VoiceService";
@@ -55,6 +59,7 @@ public class VoiceService extends Service {
 
     public static final String ACTION_STATUS = "com.voiceclock.STATUS";
     public static final String ACTION_DEBUG = "com.voiceclock.DEBUG";
+    public static final String ACTION_REQUEST_STATUS = "com.voiceclock.REQUEST_STATUS";
     public static final String EXTRA_STATUS = "status";
     public static final String EXTRA_DEBUG = "debug";
     public static final String STATUS_LOADING = "loading";
@@ -81,6 +86,16 @@ public class VoiceService extends Service {
     private volatile boolean modelReady = false;
     private volatile boolean ttsReady = false;
     private String lastError = "";
+    private String currentStatus = STATUS_LOADING;
+
+    private BroadcastReceiver statusRequestReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            if (ACTION_REQUEST_STATUS.equals(intent.getAction())) {
+                broadcastStatus(currentStatus);
+            }
+        }
+    };
 
     @Override
     public void onCreate() {
@@ -88,6 +103,11 @@ public class VoiceService extends Service {
         handler = new Handler(Looper.getMainLooper());
         audioManager = (AudioManager) getSystemService(AUDIO_SERVICE);
         createNotificationChannel();
+        
+        // Register status request receiver
+        IntentFilter filter = new IntentFilter(ACTION_REQUEST_STATUS);
+        LocalBroadcastManager.getInstance(this).registerReceiver(statusRequestReceiver, filter);
+        
         isRunning = true;
         initAll();
     }
@@ -178,8 +198,7 @@ public class VoiceService extends Service {
             extractTarBz2(downloadFile, ttsDir);
             downloadFile.delete();
             
-            markerFile.createNewFile();
-            broadcastDebug("[tts] \u6a21\u578b\u4e0b\u8f7d\u5e76\u89e3\u538b\u5b8c\u6210");
+            broadcastDebug("[tts] \u89e3\u538b\u5b8c\u6210\uff0c\u6b63\u5728\u68c0\u67e5\u6a21\u578b\u6587\u4ef6...");
         }
 
         // Find model files
@@ -192,34 +211,58 @@ public class VoiceService extends Service {
         broadcastDebug("[tts] tokens: " + (tokensFile != null ? new File(tokensFile).getName() : "NOT FOUND"));
 
         if (modelFile == null || tokensFile == null) {
-            throw new Exception("TTS model files not found after download");
+            // Delete marker if it exists since initialization failed
+            if (markerFile.exists()) {
+                markerFile.delete();
+            }
+            throw new Exception("TTS model files not found after extraction");
         }
 
-        OfflineTtsVitsModelConfig vitsConfig = OfflineTtsVitsModelConfig.builder()
-                .setModel(modelFile)
-                .setLexicon(lexiconFile != null ? lexiconFile : "")
-                .setTokens(tokensFile)
-                .setNoiseScale(0.667f)
-                .setNoiseScaleW(0.8f)
-                .setLengthScale(1.0f)
-                .build();
+        broadcastDebug("[tts] \u521d\u59cb\u5316 TTS \u5f15\u64ce...");
+        
+        try {
+            OfflineTtsVitsModelConfig vitsConfig = OfflineTtsVitsModelConfig.builder()
+                    .setModel(modelFile)
+                    .setLexicon(lexiconFile != null ? lexiconFile : "")
+                    .setTokens(tokensFile)
+                    .setNoiseScale(0.667f)
+                    .setNoiseScaleW(0.8f)
+                    .setLengthScale(1.0f)
+                    .build();
 
-        OfflineTtsModelConfig modelConfig = OfflineTtsModelConfig.builder()
-                .setVits(vitsConfig)
-                .setNumThreads(2)
-                .setDebug(false)
-                .setProvider("cpu")
-                .build();
+            OfflineTtsModelConfig modelConfig = OfflineTtsModelConfig.builder()
+                    .setVits(vitsConfig)
+                    .setNumThreads(2)
+                    .setDebug(true)
+                    .setProvider("cpu")
+                    .build();
 
-        OfflineTtsConfig config = OfflineTtsConfig.builder()
-                .setModel(modelConfig)
-                .setMaxNumSentences(1)
-                .build();
+            OfflineTtsConfig config = OfflineTtsConfig.builder()
+                    .setModel(modelConfig)
+                    .setMaxNumSentences(1)
+                    .build();
 
-        tts = new OfflineTts(config);
-        ttsSampleRate = tts.getSampleRate();
+            broadcastDebug("[tts] \u521b\u5efa OfflineTts \u5b9e\u4f8b...");
+            tts = new OfflineTts(config);
+            ttsSampleRate = tts.getSampleRate();
+            broadcastDebug("[tts] OfflineTts \u521b\u5efa\u6210\u529f, sampleRate=" + ttsSampleRate);
+        } catch (Exception e) {
+            broadcastDebug("[tts-error] \u521d\u59cb\u5316\u5931\u8d25: " + e.getClass().getSimpleName() + " - " + e.getMessage());
+            Log.e(TAG, "TTS init failed", e);
+            // Delete marker so it retries next time
+            if (markerFile.exists()) {
+                markerFile.delete();
+            }
+            throw e;
+        }
+        
+        // Only create marker after successful initialization
+        if (!markerFile.exists()) {
+            markerFile.createNewFile();
+            broadcastDebug("[tts] \u6a21\u578b\u521d\u59cb\u5316\u6210\u529f\uff0c\u5df2\u4fdd\u5b58");
+        }
+        
         ttsReady = true;
-
         broadcastDebug("[tts-ok] SherpaOnnx TTS \u5c31\u7eea (sampleRate=" + ttsSampleRate + ")");
     }
 
@@ -590,6 +633,7 @@ public class VoiceService extends Service {
     // ========== Broadcast & Notification ==========
 
     private void broadcastStatus(String status) {
+        currentStatus = status;
         Intent intent = new Intent(ACTION_STATUS);
         intent.putExtra(EXTRA_STATUS, status);
         intent.putExtra("error", lastError);
@@ -657,6 +701,13 @@ public class VoiceService extends Service {
         isListening = false;
         modelReady = false;
         ttsReady = false;
+
+        // Unregister status request receiver
+        try {
+            LocalBroadcastManager.getInstance(this).unregisterReceiver(statusRequestReceiver);
+        } catch (Exception e) {
+            // ignore
+        }
 
         if (audioRecord != null) {
             try { audioRecord.stop(); } catch (Exception e) { /* ignore */ }

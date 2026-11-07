@@ -73,7 +73,26 @@ public class LibraryUtils {
             }
         }
 
-        // 3. fallback to -Djava.library.path
+        // 3. On Android, load dependencies explicitly in correct order
+        if (isAndroid()) {
+            try {
+                System.loadLibrary("onnxruntime");
+            } catch (UnsatisfiedLinkError e) {
+                // onnxruntime might already be loaded or not needed
+                if (debug) {
+                    System.out.println("Failed to load onnxruntime: " + e.getMessage());
+                }
+            }
+            try {
+                System.loadLibrary("sherpa-onnx-cxx-api");
+            } catch (UnsatisfiedLinkError e) {
+                if (debug) {
+                    System.out.println("Failed to load sherpa-onnx-cxx-api: " + e.getMessage());
+                }
+            }
+        }
+
+        // 4. fallback to -Djava.library.path
         // java -Djava.library.path=C:\mylibs;D:\otherlibs -cp sherpa-onnx.jar xxx.java
         //
         // It throws if it cannot load the lib sherpa-onnx-jni
