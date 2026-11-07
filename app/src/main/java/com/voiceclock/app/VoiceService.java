@@ -22,6 +22,7 @@ import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
 import android.os.PowerManager;
+import android.os.StatFs;
 import android.os.SystemClock;
 import android.util.Log;
 
@@ -85,6 +86,9 @@ public class VoiceService extends Service {
     private static final long MIN_MODEL_FILE_SIZE = 100L * 1024 * 1024;
     private static final long HEARTBEAT_INTERVAL_MS = 10000L;
 
+    /** 进程级锁：防止多个初始化线程同时读写模型目录。 */
+    private static final Object MODEL_LOCK = new Object();
+
     // Vosk (speech recognition)
     private Model voskModel;
     private Recognizer recognizer;
@@ -98,6 +102,7 @@ public class VoiceService extends Service {
     private AudioFocusRequest audioFocusRequest;
     private Handler handler;
     private Thread recognitionThread;
+    private Thread initThread;
     private volatile boolean isListening = false;
     private volatile boolean modelReady = false;
     private volatile boolean ttsReady = false;
@@ -167,9 +172,8 @@ public class VoiceService extends Service {
         broadcastStatus(STATUS_LOADING);
         broadcastDebug("[init] 初始化中...");
 
-        new Thread(() -> {
+        initThread = new Thread(() -> {
             try {
-                // 1. Load Vosk model (speech recognition)
                 initVosk();
 
                 // 2. Load SherpaOnnx TTS model
@@ -194,7 +198,8 @@ public class VoiceService extends Service {
                 Log.e(TAG, "Failed to start: " + lastError, e);
                 broadcastStatus(STATUS_ERROR);
             }
-        }).start();
+        });
+        initThread.start();
     }
 
     // ========== Vosk (Speech Recognition) ==========
@@ -237,29 +242,24 @@ public class VoiceService extends Service {
         } else {
             acquireWakeLock();
             try {
-                if (archive.isFile() && archive.length() > 0) {
-                    broadcastDebug("[tts] 发现已下载的模型包，尝试续传/解压...");
-                } else {
-                    broadcastDebug("[tts] 未找到语音模型，开始下载(约116MB，请保持网络畅通)...");
-                }
-                try {
-                    downloadArchiveIfNeeded(archive);
-                } catch (IOException e) {
-                    // 保留下载了一半的文件，下次启动可以继续续传
-                    throw e;
-                }
-                try {
-                    extractArchive(archive, modelDir);
-                    archive.delete();
-                } catch (IOException e) {
-                    // 压缩包损坏或解压失败，删掉重下
-                    archive.delete();
-                    throw e;
+                // 同一个进程里可能有多个初始化线程（例如停止后立刻重新启动），
+                // 用进程级锁保证同一时刻只有一个线程在写模型目录
+                synchronized (MODEL_LOCK) {
+                    files = locateModelFiles(modelDir);
+                    if (files == null) {
+                        prepareModel(archive, modelDir);
+                        files = locateModelFiles(modelDir);
+                        if (files == null) {
+                            broadcastModelDir(modelDir);
+                            throw new Exception("语音模型文件不完整，请重新启动服务重试");
+                        }
+                        // 只有确认模型可用后才删除压缩包，失败时保留以便重试
+                        archive.delete();
+                    }
                 }
             } finally {
                 releaseWakeLock();
             }
-            files = locateModelFiles(modelDir);
         }
 
         if (files == null) {
@@ -298,6 +298,56 @@ public class VoiceService extends Service {
         ttsSampleRate = tts.getSampleRate();
         ttsReady = true;
         broadcastDebug("[tts-ok] 语音合成引擎就绪, sampleRate=" + ttsSampleRate);
+    }
+
+    private void prepareModel(File archive, File modelDir) throws IOException {
+        if (archive.isFile() && archive.length() > 0) {
+            broadcastDebug("[tts] 发现已下载的模型包，继续下载/解压...");
+        } else {
+            broadcastDebug("[tts] 未找到语音模型，开始下载(约116MB，请保持网络畅通)...");
+        }
+
+        // 下载失败时保留已下载的部分，下次启动可以续传
+        downloadArchiveIfNeeded(archive);
+
+        try {
+            extractArchive(archive, modelDir);
+        } catch (IOException e) {
+            if (destroyed) {
+                broadcastDebug("[tts] 服务已停止，保留压缩包");
+                throw e;
+            }
+            int failures = ServiceState.getTtsFailures(this) + 1;
+            ServiceState.setTtsFailures(this, failures);
+            broadcastDebug("[tts] 解压失败(" + failures + "/2): " + e.getMessage());
+            if (failures >= 2) {
+                broadcastDebug("[tts] 压缩包可能已损坏，删除后下次重新下载");
+                archive.delete();
+                ServiceState.setTtsFailures(this, 0);
+            } else {
+                broadcastDebug("[tts] 已保留压缩包，重试时无需重新下载");
+            }
+            throw e;
+        }
+        ServiceState.setTtsFailures(this, 0);
+    }
+
+    /** 校验失败时把目录里的文件打出来，方便定位是哪个文件缺了。 */
+    private void broadcastModelDir(File dir) {
+        broadcastDebug("[tts] 模型目录: " + dir.getAbsolutePath());
+        File[] files = dir.listFiles();
+        if (files == null) {
+            broadcastDebug("[tts] 目录不存在或无法读取");
+            return;
+        }
+        int shown = 0;
+        for (File f : files) {
+            if (shown++ >= 12) {
+                broadcastDebug("[tts] ...");
+                break;
+            }
+            broadcastDebug("[tts] " + f.getName() + " " + f.length() + "B");
+        }
     }
 
     /** 已解压到位的模型文件集合，缺关键文件时返回 null。 */
@@ -349,6 +399,7 @@ public class VoiceService extends Service {
                 return;
             } catch (IOException e) {
                 lastFailure = e;
+                if (destroyed) throw e;
                 broadcastDebug("[tts] 下载失败(" + attempt + "/3): " + e.getMessage());
                 setLoadingDetail("下载中断，正在重试(" + attempt + "/3)...");
                 sleepQuietly(2000);
@@ -403,6 +454,9 @@ public class VoiceService extends Service {
             byte[] buffer = new byte[128 * 1024];
             int bytesRead;
             while ((bytesRead = in.read(buffer)) != -1) {
+                if (destroyed) {
+                    throw new IOException("服务已停止，下载中断");
+                }
                 out.write(buffer, 0, bytesRead);
                 written += bytesRead;
 
@@ -484,6 +538,20 @@ public class VoiceService extends Service {
         }
 
         long archiveSize = archive.length();
+
+        // 解压后模型约 130MB，解压期间压缩包也还在，先确认空间够用
+        long needed = archiveSize + 150L * 1024 * 1024;
+        long available = -1;
+        try {
+            available = new StatFs(getFilesDir().getAbsolutePath()).getAvailableBytes();
+        } catch (Exception e) {
+            Log.w(TAG, "check free space failed", e);
+        }
+        if (available >= 0 && available < needed) {
+            throw new IOException("存储空间不足：解压需要约 " + (needed / 1024 / 1024)
+                    + "MB，当前可用 " + (available / 1024 / 1024) + "MB");
+        }
+
         broadcastDebug("[tts] 解压中 (" + (archiveSize / 1024 / 1024) + "MB)...");
         setLoadingDetail("正在解压语音模型 0%");
 
@@ -521,6 +589,9 @@ public class VoiceService extends Service {
                     // 进度必须按字节更新：最大的 onnx 是一个 117MB 的单独条目，
                     // 如果只在文件之间更新，解压期间进度会一直停在上一个文件的位置
                     while ((len = tarIn.read(buffer)) != -1) {
+                        if (destroyed) {
+                            throw new IOException("服务已停止，解压中断");
+                        }
                         out.write(buffer, 0, len);
                         writtenBytes += len;
 
@@ -543,6 +614,14 @@ public class VoiceService extends Service {
                 } finally {
                     out.close();
                 }
+
+                // 对比 tar 头里声明的大小，文件写短了（空间不足/压缩包损坏）能立刻发现
+                long declaredSize = entry.getSize();
+                long actualSize = outputFile.length();
+                if (declaredSize >= 0 && actualSize != declaredSize) {
+                    throw new IOException("解压不完整: " + name + " ("
+                            + actualSize + "/" + declaredSize + ")");
+                }
                 fileCount++;
             }
         } finally {
@@ -551,9 +630,14 @@ public class VoiceService extends Service {
             closeQuietly(counting);
         }
 
+        if (destroyed) {
+            throw new IOException("服务已停止，解压中断");
+        }
         broadcastDebug("[tts] 解压完成，共 " + fileCount + " 个文件");
 
         if (locateModelFiles(tmpDir) == null) {
+            // 把实际解压出来的文件打出来，看看是哪一项缺失
+            broadcastModelDir(tmpDir);
             deleteRecursive(tmpDir);
             throw new IOException("解压后缺少模型文件");
         }
@@ -1071,6 +1155,10 @@ public class VoiceService extends Service {
         if (recognitionThread != null) {
             recognitionThread.interrupt();
             recognitionThread = null;
+        }
+        if (initThread != null) {
+            initThread.interrupt();
+            initThread = null;
         }
         if (recognizer != null) { recognizer.close(); recognizer = null; }
         if (voskModel != null) { voskModel.close(); voskModel = null; }

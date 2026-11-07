@@ -16,6 +16,7 @@ final class ServiceState {
     private static final String KEY_ERROR = "error";
     private static final String KEY_DETAIL = "detail";
     private static final String KEY_UPDATED_AT = "updated_at";
+    private static final String KEY_TTS_FAILURES = "tts_failures";
 
     /** 超过这个时间没有心跳，认为服务已经不在运行。 */
     static final long STALE_TIMEOUT_MS = 60000L;
@@ -43,8 +44,17 @@ final class ServiceState {
         return s;
     }
 
-    static final class Snapshot {
-        boolean running;
+    static int getTtsFailures(Context context) {
+        return context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getInt(KEY_TTS_FAILURES, 0);
+    }
+
+    static void setTtsFailures(Context context, int value) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+                .putInt(KEY_TTS_FAILURES, value)
+                .apply();
+    }
+
+    static final class Snapshot {        boolean running;
         String status;
         String error;
         String detail;
